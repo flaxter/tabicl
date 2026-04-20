@@ -22,8 +22,10 @@ from tqdm import tqdm
 import wandb
 
 from tabicl import TabICL
+from tabicl.model.heads import ConditionalHead, InterventionalHead, ObservationalHead
 from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
+from tabicl.train.multi_task_loss import MultiTaskLoss
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
 
@@ -223,6 +225,52 @@ class Trainer:
             self.model = model
             self.raw_model = model
 
+        # Phase 4: build attribution heads + multi-task loss. Heads live on
+        # the trainer, not inside TabICL, so the trunk module stays
+        # unchanged and DDP's parameter sync still works for the trunk via
+        # the existing container. Heads are synced implicitly because they
+        # live under the same loss module's parameters, which participate
+        # in every backward.
+        self.build_attribution_heads(model)
+
+        # Trunk parameter list — used by the freeze-steps warmup to zero
+        # gradients on the pretraining trunk while leaving heads trainable.
+        # The list is captured post-DDP wrap so trunk params match what
+        # `self.raw_model.parameters()` iterates over.
+        self.trunk_params = list(self.raw_model.parameters())
+
+    def build_attribution_heads(self, model: TabICL) -> None:
+        """Phase 4: attach the three attribution heads + multi-task loss.
+
+        Heads are plain ``nn.Module``s that consume
+        ``model(return_column_embeddings=True)``'s second return value.
+        ``MultiTaskLoss`` owns them so a single ``loss.backward()`` covers
+        trunk + heads + learned log-sigmas.
+        """
+        if not getattr(self.config, "multi_task_enabled", False):
+            self.loss_fn = None
+            return
+
+        embed_dim = self.config.embed_dim
+        hidden = self.config.head_embed_dim or None
+        head_a = ObservationalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
+        head_i = InterventionalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
+        head_c = ConditionalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
+
+        lambdas = {
+            "pred": self.config.lambda_pred,
+            "obs": self.config.lambda_obs,
+            "int": self.config.lambda_int,
+            "cond": self.config.lambda_cond,
+        }
+        self.loss_fn = MultiTaskLoss(
+            head_a=head_a, head_i=head_i, head_c=head_c,
+            weighting=self.config.multi_task_weighting,
+            lambdas=lambdas,
+            huber_delta=self.config.huber_delta,
+            head_c_consistency_weight=self.config.head_c_consistency_weight,
+        ).to(self.config.device)
+
     def configure_prior(self):
         """Set up a tabular dataset generator for synthetic data during training."""
 
@@ -274,8 +322,14 @@ class Trainer:
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
 
+        params = list(self.raw_model.parameters())
+        # Phase 4: pool head + log-sigma params into the same optimizer so
+        # they share the scheduler/weight-decay config. Upstream TabICL
+        # has no heads, so this is a no-op when multi_task_enabled=False.
+        if getattr(self, "loss_fn", None) is not None:
+            params += list(self.loss_fn.parameters())
         self.optimizer = optim.AdamW(
-            params=self.raw_model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
+            params=params, lr=self.config.lr, weight_decay=self.config.weight_decay
         )
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
@@ -546,8 +600,10 @@ class Trainer:
         Parameters
         ----------
         micro_batch : tuple
-            (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size) tensors
-            for the micro batch.
+            Either a 5-tuple ``(X, y, d, seq_len, train_size)`` (original
+            TabICL signature; preserved for ``multi_task_enabled=False``) or a
+            9-tuple with the four Phase 3 label outputs appended:
+            ``(X, y, d, seq_len, train_size, o_star, i_star, is_id, c_triples)``.
 
         micro_batch_idx : int
             Index of the current micro batch.
@@ -558,9 +614,20 @@ class Trainer:
         Returns
         -------
         dict
-            Result dictionary with 'ce' and 'accuracy' keys.
+            Metrics for logging: at minimum ``ce`` and ``accuracy``; with
+            multi-task training, also ``loss_A``, ``loss_I``, ``loss_C``,
+            ``loss_cons`` and their weights.
         """
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        has_labels = len(micro_batch) == 9
+        if has_labels:
+            (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size,
+             micro_o, micro_i, micro_is_id, micro_c_triples) = micro_batch
+        else:
+            (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size) = micro_batch
+            micro_o = micro_i = None
+            micro_is_id = None
+            micro_c_triples = None
+
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
@@ -568,6 +635,10 @@ class Trainer:
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
+        if has_labels:
+            micro_o = micro_o.to(self.config.device)
+            micro_i = micro_i.to(self.config.device)
+            micro_is_id = micro_is_id.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -576,19 +647,47 @@ class Trainer:
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
+        use_multi_task = has_labels and getattr(self, "loss_fn", None) is not None
+
         with self.amp_ctx:
-            pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
-            pred = pred.flatten(end_dim=-2)
-            true = y_test.long().flatten()
-            loss = F.cross_entropy(pred, true)
+            if use_multi_task:
+                logits, col_emb = self.model(
+                    micro_X, y_train, micro_d, return_column_embeddings=True
+                )
+                total_loss, bd = self.loss_fn(
+                    logits=logits, y_true=y_test,
+                    col_emb=col_emb,
+                    o_star=micro_o, i_star=micro_i,
+                    is_id=micro_is_id, c_triples=micro_c_triples,
+                    d=micro_d,
+                )
+                pred = logits.flatten(end_dim=-2)
+                true = y_test.long().flatten()
+                loss = total_loss
+            else:
+                pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
+                pred = pred.flatten(end_dim=-2)
+                true = y_test.long().flatten()
+                loss = F.cross_entropy(pred, true)
+                bd = None
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
 
         with torch.no_grad():
-            micro_results = {}
-            micro_results["ce"] = scaled_loss.item()
+            micro_results = {"ce": (bd.pred if bd else scaled_loss.item())}
+            if bd is not None:
+                micro_results["loss_total"] = scaled_loss.item()
+                micro_results["loss_A"] = bd.A / num_micro_batches
+                micro_results["loss_I"] = bd.I / num_micro_batches
+                micro_results["loss_C"] = bd.C / num_micro_batches
+                micro_results["loss_cons"] = bd.cons / num_micro_batches
+                micro_results["w_pred"] = bd.w_pred
+                micro_results["w_A"] = bd.w_A
+                micro_results["w_I"] = bd.w_I
+                micro_results["w_C"] = bd.w_C
+                micro_results["ce"] = bd.pred / num_micro_batches
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
 
@@ -621,13 +720,27 @@ class Trainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
-        # Pad nested tensors to the same size
-        batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+        # Pad nested tensors to the same size (tensor elements only).
+        batch = [
+            t.to_padded_tensor(padding=0.0) if isinstance(t, torch.Tensor) and t.is_nested else t
+            for t in batch
+        ]
 
-        # Split the batch into micro-batches along the first dimension
+        # Split the batch into micro-batches along the first dimension.
+        # Phase 4's 9-tuple carries a Python list for `c_triples`, which is
+        # not torch-splittable — slice it explicitly by row indices.
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
-        micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
-        micro_batches = list(zip(*micro_batches))
+        mbs = self.config.micro_batch_size
+
+        def _split_one(t):
+            if isinstance(t, torch.Tensor):
+                return list(torch.split(t, mbs, dim=0))
+            if isinstance(t, list):
+                return [t[i:i + mbs] for i in range(0, len(t), mbs)]
+            raise TypeError(f"Unsupported batch element type: {type(t)}")
+
+        split_parts = [_split_one(t) for t in batch]
+        micro_batches = list(zip(*split_parts))
 
         results = {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
@@ -656,6 +769,21 @@ class Trainer:
         if self.config.gradient_clipping > 0:
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            if getattr(self, "loss_fn", None) is not None:
+                nn.utils.clip_grad_norm_(self.loss_fn.parameters(), self.config.gradient_clipping)
+
+        # Phase 4: trunk-freeze warmup — zero gradients on the pretraining
+        # trunk for the first N steps so the heads stabilise before the
+        # trunk starts moving. Orthogonal to `--freeze_{col,row,icl}`,
+        # which freeze modules for the *entire* run.
+        if (
+            getattr(self, "loss_fn", None) is not None
+            and getattr(self.config, "trunk_freeze_steps", 0) > 0
+            and self.curr_step < self.config.trunk_freeze_steps
+        ):
+            for p in self.trunk_params:
+                if p.grad is not None:
+                    p.grad.zero_()
 
         # Update parameters
         self.scaler.step(self.optimizer)

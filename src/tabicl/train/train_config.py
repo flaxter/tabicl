@@ -203,6 +203,46 @@ def build_parser():
     )
 
     ###########################################################################
+    ###### Phase 4: Multi-task training (attribution heads) ####################
+    ###########################################################################
+    parser.add_argument(
+        "--multi_task_enabled",
+        default=True,
+        type=str2bool,
+        help="Phase 4: train attribution heads (A/I/C) alongside the classification head.",
+    )
+    parser.add_argument(
+        "--multi_task_weighting",
+        default="uncertainty",
+        type=str,
+        choices=["uncertainty", "manual"],
+        help="Loss combination scheme: 'uncertainty' (Kendall et al. 2018, learned log-sigma) or 'manual' lambdas.",
+    )
+    parser.add_argument("--lambda_pred", type=float, default=1.0, help="Manual lambda on classification loss.")
+    parser.add_argument("--lambda_obs", type=float, default=1.0, help="Manual lambda on Head A (observational).")
+    parser.add_argument("--lambda_int", type=float, default=1.0, help="Manual lambda on Head I (interventional).")
+    parser.add_argument("--lambda_cond", type=float, default=1.0, help="Manual lambda on Head C (conditional).")
+    parser.add_argument("--huber_delta", type=float, default=1.0, help="Huber loss delta for attribution heads.")
+    parser.add_argument(
+        "--head_c_consistency_weight",
+        type=float,
+        default=0.0,
+        help="Weight on |head_a_i - head_c_{i|-i}| consistency penalty. 0 disables.",
+    )
+    parser.add_argument(
+        "--trunk_freeze_steps",
+        type=int,
+        default=1000,
+        help="Number of initial steps where trunk gradients are zeroed (heads train alone).",
+    )
+    parser.add_argument(
+        "--head_embed_dim",
+        type=int,
+        default=None,
+        help="Hidden dim inside each attribution head's MLP. Defaults to model embed_dim.",
+    )
+
+    ###########################################################################
     ###### Checkpointing ######################################################
     ###########################################################################
     parser.add_argument("--checkpoint_dir", default=None, type=str, help="Directory for checkpoint saving and loading")
