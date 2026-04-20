@@ -33,10 +33,26 @@ from torch.utils.data import IterableDataset
 
 from .mlp_scm import MLPSCM
 from .tree_scm import TreeSCM
+from .identifiable_scm import LiNGAMSCM, ANMSCM, TreeSCM_Ident
+from .labels import compute_labels
 
 from .hp_sampling import HpSamplerList
 from .reg2cls import Reg2Cls
 from .prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+
+
+# Registry of prior_type → SCM class. Kept centralised so get_prior(),
+# generate_dataset() and the label-mode dispatch stay in sync.
+_PRIOR_REGISTRY: Dict[str, type] = {
+    "mlp_scm": MLPSCM,
+    "tree_scm": TreeSCM,
+    "lingam_scm": LiNGAMSCM,
+    "anm_scm": ANMSCM,
+    "tree_path_scm": TreeSCM_Ident,
+}
+
+# Priors that emit labels with is_identifiable=True by construction.
+_IDENTIFIABLE_PRIORS = {"lingam_scm", "anm_scm", "tree_path_scm"}
 
 
 warnings.filterwarnings(
@@ -519,7 +535,9 @@ class SCMPrior(Prior):
         return hp_sampler.sample()
 
     @torch.no_grad()
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
+    def generate_dataset(
+        self, params: Dict[str, Any]
+    ) -> Tuple[Tensor, Tensor, Tensor, Dict[str, Any]]:
         """Generate a single valid dataset based on the provided parameters.
 
         Parameters
@@ -538,18 +556,46 @@ class SCMPrior(Prior):
 
         d : Tensor
             Number of active features after filtering (scalar Tensor).
+
+        labels : dict
+            Phase 3 attribution labels: ``{"o_star", "i_star", "c_triples",
+            "is_identifiable"}``. Computed on the continuous pre-``Reg2Cls``
+            outcome; Phase 4's training loss must account for the scale
+            mismatch with the discretised class labels returned in ``y``.
         """
 
-        if params["prior_type"] == "mlp_scm":
-            prior_cls = MLPSCM
-        elif params["prior_type"] == "tree_scm":
-            prior_cls = TreeSCM
-        else:
-            raise ValueError(f"Unknown prior type {params['prior_type']}")
+        prior_type = params["prior_type"]
+        if prior_type not in _PRIOR_REGISTRY:
+            raise ValueError(f"Unknown prior type {prior_type}")
+        prior_cls = _PRIOR_REGISTRY[prior_type]
 
         while True:
-            X, y = prior_cls(**params)()
-            X, y = Reg2Cls(params)(X, y)
+            scm = prior_cls(**params)
+            X_raw, y_raw = scm()
+
+            # Phase 3: labels are computed on the continuous pre-Reg2Cls (X, y).
+            if params.get("label_compute", True):
+                mode_map = params.get("label_mode_per_prior", {})
+                mode = mode_map.get(prior_type)
+                labels = compute_labels(
+                    scm,
+                    X_raw,
+                    y_raw,
+                    params=params,
+                    n_mc=params.get("label_n_mc", 2048),
+                    k_cond_triples=params.get("label_k_cond_triples", 16),
+                    mode=mode,
+                )
+            else:
+                p = params["num_features"]
+                labels = {
+                    "o_star": torch.full((p,), float("nan")),
+                    "i_star": torch.full((p,), float("nan")),
+                    "c_triples": [],
+                    "is_identifiable": False,
+                }
+
+            X, y = Reg2Cls(params)(X_raw, y_raw)
 
             # Add batch dim for single dataset to be compatible with delete_unique_features and sanity_check
             X, y = X.unsqueeze(0), y.unsqueeze(0)
@@ -558,10 +604,14 @@ class SCMPrior(Prior):
             # Only keep valid datasets with sufficient features and balanced classes
             X, d = self.delete_unique_features(X, d)
             if (d > 0).all() and self.sanity_check(X, y, params["train_size"]):
-                return X.squeeze(0), y.squeeze(0), d.squeeze(0)
+                return X.squeeze(0), y.squeeze(0), d.squeeze(0), labels
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(
+        self,
+        batch_size: Optional[int] = None,
+        return_labels: bool = True,
+    ) -> Tuple:
         """Generate a batch of datasets by first creating a parameter list and then processing it.
 
         Parameters
@@ -569,25 +619,20 @@ class SCMPrior(Prior):
         batch_size : int, optional
             Batch size override. If None, uses self.batch_size.
 
+        return_labels : bool, default=True
+            If ``True``, also return Phase 3 attribution labels
+            (``o_star``, ``i_star``, ``is_identifiable``, ``c_triples``) in a
+            nine-tuple. Setting this to ``False`` restores the original
+            five-tuple signature for callers that predate Phase 3.
+
         Returns
         -------
-        X : Tensor or NestedTensor
-            Features tensor. If seq_len_per_gp=False, shape is
-            ``(batch_size, seq_len, max_features)``.
-            If seq_len_per_gp=True, returns a NestedTensor.
+        Nine-tuple (``return_labels=True``) of::
 
-        y : Tensor or NestedTensor
-            Labels tensor. If seq_len_per_gp=False, shape is ``(batch_size, seq_len)``.
-            If seq_len_per_gp=True, returns a NestedTensor.
+            X, y, d, seq_lens, train_sizes,
+            o_star, i_star, is_identifiable, c_triples
 
-        d : Tensor
-            Number of active features per dataset after filtering, shape ``(batch_size,)``.
-
-        seq_lens : Tensor
-            Sequence length for each dataset, shape ``(batch_size,)``.
-
-        train_sizes : Tensor
-            Position for train/test split for each dataset, shape ``(batch_size,)``.
+        or the original five-tuple (``return_labels=False``).
         """
         batch_size = batch_size or self.batch_size
 
@@ -683,7 +728,7 @@ class SCMPrior(Prior):
         else:
             results = [self.generate_dataset(params) for params in param_list]
 
-        X_list, y_list, d_list = zip(*results)
+        X_list, y_list, d_list, labels_list = zip(*results)
 
         # Combine Results
         if self.seq_len_per_gp:
@@ -702,12 +747,30 @@ class SCMPrior(Prior):
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
-        return X, y, d, seq_lens, train_sizes
+        if not return_labels:
+            return X, y, d, seq_lens, train_sizes
+
+        # Pad per-sample label tensors to the global max_features so they
+        # stack cleanly. NaN (not zero) because zero is a meaningful label
+        # value; NaN signals "no label here".
+        max_feat = self.max_features
+        o_star = torch.full((len(labels_list), max_feat), float("nan"), device=self.device)
+        i_star = torch.full((len(labels_list), max_feat), float("nan"), device=self.device)
+        is_identifiable = torch.zeros(len(labels_list), dtype=torch.bool, device=self.device)
+        c_triples: list = []
+        for b, lab in enumerate(labels_list):
+            p = lab["o_star"].shape[0]
+            o_star[b, :p] = lab["o_star"].to(self.device)
+            i_star[b, :p] = lab["i_star"].to(self.device)
+            is_identifiable[b] = bool(lab["is_identifiable"])
+            c_triples.append(lab["c_triples"])
+
+        return X, y, d, seq_lens, train_sizes, o_star, i_star, is_identifiable, c_triples
 
     def get_prior(self) -> str:
         """Determine which prior type to use for generation.
 
-        For 'mix_scm' prior type, randomly selects between available priors
+        For mixed prior types, randomly selects between the component priors
         based on configured probabilities.
 
         Returns
@@ -717,8 +780,11 @@ class SCMPrior(Prior):
         """
         if self.prior_type == "mix_scm":
             return np.random.choice(["mlp_scm", "tree_scm"], p=self.fixed_hp.get("mix_probas", [0.7, 0.3]))
-        else:
-            return self.prior_type
+        if self.prior_type == "mix_scm_identifiable":
+            # Uniform over the three identifiable families. Phase 3
+            # benchmark exercises this as a single combined prior.
+            return str(np.random.choice(["lingam_scm", "anm_scm", "tree_path_scm"]))
+        return self.prior_type
 
 
 class DummyPrior(Prior):
@@ -789,35 +855,16 @@ class DummyPrior(Prior):
         self.device = device
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(
+        self,
+        batch_size: Optional[int] = None,
+        return_labels: bool = True,
+    ) -> Tuple:
         """Generate a batch of random datasets for testing purposes.
 
-        Parameters
-        ----------
-        batch_size : int, optional
-            Batch size override, if None, uses self.batch_size.
-
-        Returns
-        -------
-        X : Tensor
-            Features tensor of shape ``(batch_size, seq_len, max_features)``.
-            Contains random Gaussian values for all features.
-
-        y : Tensor
-            Labels tensor of shape ``(batch_size, seq_len)``.
-            Contains randomly assigned class labels.
-
-        d : Tensor
-            Number of features per dataset of shape ``(batch_size,)``.
-            Always set to max_features for DummyPrior.
-
-        seq_lens : Tensor
-            Sequence length for each dataset of shape ``(batch_size,)``.
-            All datasets share the same sequence length.
-
-        train_sizes : Tensor
-            Position for train/test split for each dataset of shape ``(batch_size,)``.
-            All datasets share the same split position.
+        See :meth:`SCMPrior.get_batch` for the ``return_labels`` semantics —
+        ``DummyPrior`` emits all-NaN / False labels so the interface stays
+        prior-agnostic.
         """
 
         batch_size = batch_size or self.batch_size
@@ -833,7 +880,14 @@ class DummyPrior(Prior):
         seq_lens = torch.full((batch_size,), seq_len, device=self.device)
         train_sizes = torch.full((batch_size,), train_size, device=self.device)
 
-        return X, y, d, seq_lens, train_sizes
+        if not return_labels:
+            return X, y, d, seq_lens, train_sizes
+
+        o_star = torch.full((batch_size, self.max_features), float("nan"), device=self.device)
+        i_star = torch.full((batch_size, self.max_features), float("nan"), device=self.device)
+        is_identifiable = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        c_triples: list = [[] for _ in range(batch_size)]
+        return X, y, d, seq_lens, train_sizes, o_star, i_star, is_identifiable, c_triples
 
 
 class PriorDataset(IterableDataset):
@@ -946,7 +1000,15 @@ class PriorDataset(IterableDataset):
                 max_train_size=max_train_size,
                 device=device,
             )
-        elif prior_type in ["mlp_scm", "tree_scm", "mix_scm"]:
+        elif prior_type in [
+            "mlp_scm",
+            "tree_scm",
+            "mix_scm",
+            "lingam_scm",
+            "anm_scm",
+            "tree_path_scm",
+            "mix_scm_identifiable",
+        ]:
             self.prior = SCMPrior(
                 batch_size=batch_size,
                 batch_size_per_gp=batch_size_per_gp,
@@ -970,7 +1032,9 @@ class PriorDataset(IterableDataset):
             )
         else:
             raise ValueError(
-                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', or 'dummy'."
+                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', "
+                "'tree_scm', 'mix_scm', 'lingam_scm', 'anm_scm', 'tree_path_scm', "
+                "'mix_scm_identifiable', or 'dummy'."
             )
 
         self.batch_size = batch_size
@@ -988,41 +1052,23 @@ class PriorDataset(IterableDataset):
         self.device = device
         self.prior_type = prior_type
 
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(
+        self,
+        batch_size: Optional[int] = None,
+        return_labels: bool = True,
+    ) -> Tuple:
         """Generate a new batch of datasets.
 
-        Parameters
-        ----------
-        batch_size : int, optional
-            If provided, overrides the default batch size for this call.
+        When ``return_labels`` is True (default), the nine-tuple contains Phase
+        3 attribution-label tensors padded to ``max_features``::
 
-        Returns
-        -------
-        X : Tensor or NestedTensor
-            1. For SCM-based priors:
-             - If seq_len_per_gp=False, shape is ``(batch_size, seq_len, max_features)``.
-             - If seq_len_per_gp=True, returns a NestedTensor.
+            X, y, d, seq_lens, train_sizes,
+            o_star, i_star, is_identifiable, c_triples
 
-            2. For DummyPrior, random Gaussian values of
-            ``(batch_size, seq_len, max_features)``.
-
-        y : Tensor or NestedTensor
-            1. For SCM-based priors:
-             - If seq_len_per_gp=False, shape is ``(batch_size, seq_len)``.
-             - If seq_len_per_gp=True, returns a NestedTensor.
-
-            2. For DummyPrior, random class labels of ``(batch_size, seq_len)``.
-
-        d : Tensor
-            Number of active features per dataset of shape ``(batch_size,)``.
-
-        seq_lens : Tensor
-            Sequence length for each dataset of shape ``(batch_size,)``.
-
-        train_sizes : Tensor
-            Position for train/test split for each dataset of shape ``(batch_size,)``.
+        Set ``return_labels=False`` to preserve the original five-tuple
+        signature for callers that predate Phase 3.
         """
-        return self.prior.get_batch(batch_size)
+        return self.prior.get_batch(batch_size, return_labels=return_labels)
 
     def __iter__(self) -> "PriorDataset":
         """Return an iterator that yields batches indefinitely.

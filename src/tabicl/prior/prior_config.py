@@ -16,6 +16,17 @@ DEFAULT_FIXED_HP = {
     "scale_by_max_features": False,
     "permute_features": True,
     "permute_labels": True,
+    # Phase 3: attribution labels (A/I/C) emitted alongside (X, y).
+    "label_compute": True,
+    "label_n_mc": 2048,
+    "label_k_cond_triples": 16,
+    "label_mode_per_prior": {
+        "lingam_scm": "closed_form",
+        "anm_scm": "mc",
+        "tree_path_scm": "mc",
+        "mlp_scm": "mc",
+        "tree_scm": "mc",
+    },
 }
 
 DEFAULT_SAMPLED_HP = {

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import random
+from typing import Any, Dict, Optional, Tuple
+
 import numpy as np
 import torch
-from torch import nn
+from torch import nn, Tensor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
@@ -73,7 +75,8 @@ class TreeLayer(nn.Module):
         """Applies the fitted tree-based transformation to the input features.
 
         Fits the internal tree model using X and random targets, then predicts
-        and returns the outputs.
+        and returns the outputs. The fitted model is cached on the layer so
+        that Phase 3's ``simulate()`` reruns can reuse it without refitting.
 
         Parameters
         ----------
@@ -86,14 +89,27 @@ class TreeLayer(nn.Module):
             Transformed features tensor of shape ``(n_samples, out_dim)``.
         """
         X = X.nan_to_num(0.0).cpu()
-        y_fake = np.random.randn(X.shape[0], self.out_dim)
-        self.model.fit(X, y_fake)
+        if not getattr(self, "_is_fit", False):
+            y_fake = np.random.randn(X.shape[0], self.out_dim)
+            self.model.fit(X, y_fake)
+            self._is_fit = True
         y = self.model.predict(X)
         y = torch.tensor(y, dtype=torch.float, device=self.device)
 
         if self.out_dim == 1:
             y = y.view(-1, 1)
 
+        return y
+
+    def predict(self, X: torch.Tensor) -> torch.Tensor:
+        """Predict with the cached tree model (must have been fit already)."""
+        if not getattr(self, "_is_fit", False):
+            return self.forward(X)
+        X = X.nan_to_num(0.0).cpu()
+        y = self.model.predict(X)
+        y = torch.tensor(y, dtype=torch.float, device=self.device)
+        if self.out_dim == 1:
+            y = y.view(-1, 1)
         return y
 
 
@@ -370,9 +386,62 @@ class TreeSCM(nn.Module):
             # Select input features and targets from outputs
             X = outputs_flat[:, indices_X]
             y = outputs_flat[:, indices_y]
+            self._indices_X = indices_X
+            self._indices_y = indices_y
         else:
             # In non-causal mode, use original causes and last layer output
             X = causes
             y = outputs[-1]
+            self._indices_X = None
+            self._indices_y = None
+
+        return X, y
+
+    # ------------------------------------------------------------------
+    # Phase 3: fresh-noise Monte Carlo reruns (reuses cached trees)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def simulate(
+        self,
+        intervene_on: Optional[Dict[int, float]] = None,
+        n_samples: Optional[int] = None,
+        rng: Optional[Any] = None,
+        **_: Any,
+    ) -> Tuple[Tensor, Tensor]:
+        """Rerun the tree layers on freshly-sampled causes.
+
+        Trees from the initial forward pass are cached (see ``TreeLayer``)
+        and reused, so this path avoids the bulk of the XGBoost fit cost.
+        ``intervene_on`` is accepted for interface parity but ignored —
+        TreeSCM is non-identifiable (``notes/PHASE3.md`` §Risks).
+        """
+        n = n_samples or self.seq_len
+        old_seq_len = self.xsampler.seq_len
+        self.xsampler.seq_len = n
+        try:
+            causes = self.xsampler.sample()
+        finally:
+            self.xsampler.seq_len = old_seq_len
+
+        outputs = [causes]
+        for layer in self.layers:
+            outputs.append(layer(outputs[-1]))
+        outputs = outputs[2:]
+
+        if self.is_causal and getattr(self, "_indices_X", None) is not None:
+            outputs_flat = torch.cat(outputs, dim=-1)
+            X = outputs_flat[:, self._indices_X]
+            y = outputs_flat[:, self._indices_y]
+        else:
+            X = causes
+            y = outputs[-1]
+
+        if torch.any(torch.isnan(X)) or torch.any(torch.isnan(y)):
+            X[:] = 0.0
+            y[:] = -100.0
+
+        if self.num_outputs == 1:
+            y = y.squeeze(-1)
 
         return X, y
