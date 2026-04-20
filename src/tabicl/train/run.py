@@ -425,6 +425,18 @@ class Trainer:
             "scheduler_state": self.scheduler.state_dict(),
             "curr_step": self.curr_step,
         }
+        # Phase 5: persist attribution-head state so TabICLExplainer can
+        # reconstruct the heads without re-running training.
+        if getattr(self, "loss_fn", None) is not None:
+            checkpoint["heads"] = {
+                "observational": self.loss_fn.head_a.state_dict(),
+                "interventional": self.loss_fn.head_i.state_dict(),
+                "conditional": self.loss_fn.head_c.state_dict(),
+                "config": {
+                    "embed_dim": self.config.embed_dim,
+                    "hidden_dim": self.config.head_embed_dim,
+                },
+            }
         torch.save(checkpoint, checkpoint_path)
 
     def manage_checkpoint(self):

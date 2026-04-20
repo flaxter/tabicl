@@ -3,6 +3,7 @@ from .model.inference_config import InferenceConfig
 
 from .sklearn.classifier import TabICLClassifier
 from .sklearn.regressor import TabICLRegressor
+from .sklearn.explainer import TabICLExplainer
 
 
 def __getattr__(name):
