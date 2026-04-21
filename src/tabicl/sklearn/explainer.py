@@ -60,6 +60,28 @@ _IDENTIFIABILITY_DISCLAIMER = (
 class TabICLExplainer(BaseEstimator):
     """Wrap a fitted TabICL estimator with the Phase 5 attribution API.
 
+    This is the scikit-learn surface that exposes the three attribution
+    heads trained during Phase 4 (observational :math:`o^*_i`,
+    interventional :math:`\\iota^*_i`, conditional :math:`c^*_{i \\mid S}`)
+    without altering the base estimator's prediction contract. Prediction
+    continues to go through ``base_estimator_``'s 8-member ensemble;
+    attribution is computed once on a single canonical view of the data
+    from a single forward pass with ``return_column_embeddings=True``.
+
+    .. warning::
+
+       :meth:`conditional_relevance_graph` returns a thresholded
+       pairwise-Head-C adjacency matrix. It is **not** a causal DAG
+       and must not be interpreted as one. See the method's docstring
+       for the full caveat.
+
+    .. warning::
+
+       :attr:`interventional_effects_` is meaningful only within the
+       Head I identifiability scope (LiNGAM, ANM, tree-SCM). Always
+       read :attr:`identifiability_scope_` before citing these scores
+       as causal effects.
+
     Parameters
     ----------
     base_estimator : TabICLClassifier or TabICLRegressor
@@ -230,6 +252,18 @@ class TabICLExplainer(BaseEstimator):
         "what does ``X_j`` add given ``X_i`` is known" and marks the edge
         ``(i, j)`` as ``True`` iff that score exceeds ``threshold``.
 
+        .. warning::
+
+           **This is not a causal DAG.** Edges here encode conditional
+           observational relevance: feature ``j`` adds predictive signal
+           beyond ``{X_i}``. They do not encode causal mechanisms,
+           direct-cause edges, or Markov equivalence. Using this graph
+           as a substitute for causal discovery will produce incorrect
+           conclusions. For causal readings use
+           :attr:`interventional_effects_`, subject to the
+           :attr:`identifiability_scope_` caveat, or pipe a
+           causal-discovery front-end.
+
         Parameters
         ----------
         threshold : float, default=0.1
@@ -242,7 +276,11 @@ class TabICLExplainer(BaseEstimator):
         ndarray of shape (n_features_in_, n_features_in_), dtype=bool
             Directed adjacency matrix. **Not** a causal DAG — each edge
             indicates conditional observational relevance, not a causal
-            mechanism. See PLAN.md §Phase 5 key decision #17.
+            mechanism. See
+            ``learning-to-explain/notes/PLAN.md`` §Phase 5 key decision
+            #17 for the rationale behind the ``conditional_relevance_graph``
+            name (renamed from the old ``causal_attention_graph`` to
+            prevent this exact confusion).
         """
         check_is_fitted(self, "base_estimator_")
         p = self.n_features_in_
