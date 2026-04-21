@@ -12,10 +12,28 @@ from .metrics import (
     topk_recall_per_dataset,
     aggregate_metrics,
 )
+from .explainer_eval import (
+    GroundTruth,
+    DatasetSpec,
+    DatasetScore,
+    canonical_states,
+    score_one,
+    evaluate_explainer,
+    build_in_distribution_suite,
+    build_held_out_prior_suite,
+)
 
 __all__ = [
     "spearman_per_dataset",
     "pearson_per_dataset",
     "topk_recall_per_dataset",
     "aggregate_metrics",
+    "GroundTruth",
+    "DatasetSpec",
+    "DatasetScore",
+    "canonical_states",
+    "score_one",
+    "evaluate_explainer",
+    "build_in_distribution_suite",
+    "build_held_out_prior_suite",
 ]
