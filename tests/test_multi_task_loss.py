@@ -1,196 +1,134 @@
-"""Phase 4 — multi-task loss unit tests.
-
-Covers the six invariants from the Phase 4 plan:
-  1. Uncertainty weighting: grads flow everywhere, including log_sigma.
-  2. is_identifiable mask zeros Head I contribution.
-  3. NaN-padded labels past `d` are ignored.
-  4. Varied per-sample c_triple counts are handled.
-  5. Manual lambdas path applies supplied scalars.
-  6. Consistency penalty couples Head A and Head C.
-
-All tests run on CPU, seeded, total runtime < 20 s.
-"""
+"""Tests for PredictiveValueLoss (pred CE + value Huber)."""
 from __future__ import annotations
 
-import math
+from typing import List
 
 import pytest
 import torch
 
-from tabicl.model.heads import ConditionalHead, InterventionalHead, ObservationalHead
-from tabicl.train.multi_task_loss import MultiTaskLoss
+from tabicl.model.heads import ConditionalPredictiveValueHead
+from tabicl.prior.labels import ValueQuery
+from tabicl.train.multi_task_loss import LossBreakdown, PredictiveValueLoss
 
 
-def _build_heads_and_loss(E: int = 16, **kwargs) -> MultiTaskLoss:
+def _build_loss(embed_dim: int = 8, weighting: str = "uncertainty") -> PredictiveValueLoss:
     torch.manual_seed(0)
-    head_a = ObservationalHead(embed_dim=E)
-    head_i = InterventionalHead(embed_dim=E)
-    head_c = ConditionalHead(embed_dim=E)
-    return MultiTaskLoss(head_a=head_a, head_i=head_i, head_c=head_c, **kwargs)
+    head = ConditionalPredictiveValueHead(embed_dim=embed_dim)
+    return PredictiveValueLoss(value_head=head, weighting=weighting)
 
 
-def _fake_batch(B: int = 3, H: int = 4, E: int = 16, T: int = 5, C: int = 3):
-    torch.manual_seed(1)
-    logits = torch.randn(B, T, C)
-    y_true = torch.randint(0, C, (B, T))
+def _make_labels(B: int, p: int, n_queries: int = 2) -> List[dict]:
+    """Construct a batch of synthetic labels for smoke-testing."""
+    labels: List[dict] = []
+    for b in range(B):
+        qs: List[ValueQuery] = []
+        for q in range(n_queries):
+            S_mask = torch.zeros(p, dtype=torch.bool)
+            if q == 1:
+                S_mask[0] = True  # singleton S = {0}
+            targets = torch.full((p,), 0.5, dtype=torch.float)
+            if q == 1:
+                targets[0] = float("nan")  # NaN inside S
+            qs.append(
+                ValueQuery(
+                    S_mask=S_mask,
+                    targets=targets,
+                    raw_targets=None,
+                    query_type="empty" if q == 0 else "singleton",
+                )
+            )
+        labels.append({"value_queries": qs, "y_var_raw": 1.0, "label_scale": "rms_y_units"})
+    return labels
+
+
+def test_forward_returns_finite_loss_and_breakdown():
+    B, T_test, C, H, E = 2, 3, 4, 5, 8
+    loss_fn = _build_loss(embed_dim=E)
+    logits = torch.randn(B, T_test, C)
+    y_true = torch.randint(0, C, (B, T_test))
+    col_emb = torch.randn(B, H, E)
+    d = torch.tensor([H, H])
+    labels = _make_labels(B, p=H)
+    total, bd = loss_fn(logits, y_true, col_emb, labels, d)
+    assert torch.isfinite(total)
+    assert isinstance(bd, LossBreakdown)
+    assert bd.pred >= 0
+    assert bd.value >= 0
+
+
+def test_value_head_gets_gradients():
+    B, T_test, C, H, E = 2, 2, 3, 4, 8
+    loss_fn = _build_loss(embed_dim=E)
+    logits = torch.randn(B, T_test, C, requires_grad=True)
+    y_true = torch.randint(0, C, (B, T_test))
     col_emb = torch.randn(B, H, E, requires_grad=True)
-    o_star = torch.rand(B, H)
-    i_star = torch.rand(B, H)
-    is_id = torch.tensor([True, True, True])
-    c_triples = [
-        [(0, torch.tensor([False, True, False, False]), 0.1)],
-        [(1, torch.tensor([True, False, False, False]), 0.2),
-         (2, torch.tensor([True, True, False, False]), 0.05)],
-        [(0, torch.tensor([False, False, True, False]), 0.15)],
-    ]
-    d = torch.tensor([H, H, H])
-    return logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d
-
-
-# ---------------------------------------------------------------------------
-# Test 1 — uncertainty weighting end-to-end
-# ---------------------------------------------------------------------------
-
-
-def test_uncertainty_weighting_shapes_and_grad():
-    """Loss is a scalar; backward() populates grads on trunk, heads, log_sigma."""
-    loss_mod = _build_heads_and_loss(weighting="uncertainty")
-    logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d = _fake_batch()
-
-    total, bd = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-    assert total.ndim == 0
-    assert math.isfinite(total.item())
+    d = torch.tensor([H, H])
+    labels = _make_labels(B, p=H)
+    total, _ = loss_fn(logits, y_true, col_emb, labels, d)
     total.backward()
-
-    # col_emb (proxy for trunk) gets a gradient.
-    assert col_emb.grad is not None and torch.isfinite(col_emb.grad).all()
-
-    # Every parameter under the loss module has a gradient (heads + log_sigma).
-    for name, p in loss_mod.named_parameters():
-        assert p.grad is not None, name
-        assert torch.isfinite(p.grad).all(), name
-
-    # Reasonable breakdown values.
-    assert bd.pred > 0 and bd.A >= 0 and bd.I >= 0 and bd.C >= 0
+    # Every value-head parameter must have a non-None grad with finite values.
+    for name, p in loss_fn.value_head.named_parameters():
+        assert p.grad is not None, f"no grad for {name}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad in {name}"
 
 
-# ---------------------------------------------------------------------------
-# Test 2 — is_identifiable mask zeros Head I
-# ---------------------------------------------------------------------------
+def test_no_labels_gives_zero_value_loss():
+    B, T_test, C, H, E = 1, 2, 3, 4, 8
+    loss_fn = _build_loss(embed_dim=E)
+    logits = torch.randn(B, T_test, C)
+    y_true = torch.randint(0, C, (B, T_test))
+    col_emb = torch.randn(B, H, E)
+    d = torch.tensor([H])
+    labels = [{"value_queries": [], "y_var_raw": 1.0, "label_scale": "rms_y_units"}]
+    total, bd = loss_fn(logits, y_true, col_emb, labels, d)
+    assert bd.value == 0.0
 
 
-def test_is_identifiable_mask_zeros_head_i():
-    """With is_id all False, Head I loss is zero."""
-    loss_mod = _build_heads_and_loss(weighting="manual",
-                                     lambdas={"pred": 0.0, "obs": 0.0, "int": 1.0, "cond": 0.0})
-    logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d = _fake_batch()
-    is_id_all_false = torch.zeros(is_id.shape, dtype=torch.bool)
+def test_nan_targets_excluded_from_loss():
+    """Completely NaN targets should produce zero value-loss (nothing to fit)."""
+    B, T_test, C, H, E = 1, 2, 3, 4, 8
+    loss_fn = _build_loss(embed_dim=E)
+    logits = torch.randn(B, T_test, C)
+    y_true = torch.randint(0, C, (B, T_test))
+    col_emb = torch.randn(B, H, E)
+    d = torch.tensor([H])
 
-    total_false, bd_false = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id_all_false, c_triples, d)
-    assert bd_false.I == 0.0
-
-    # With is_id all True the Head I loss is positive (not coincidentally zero).
-    total_true, bd_true = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-    assert bd_true.I > 0.0
-
-
-# ---------------------------------------------------------------------------
-# Test 3 — NaN-padded labels past `d` are ignored
-# ---------------------------------------------------------------------------
-
-
-def test_nan_padded_labels_ignored():
-    """NaN values past the active-feature boundary don't poison the loss."""
-    loss_mod = _build_heads_and_loss(weighting="uncertainty")
-    logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d = _fake_batch()
-    # Mark one sample as having only 2 active features; NaN-pad the rest.
-    d = torch.tensor([2, 4, 4])
-    o_star[0, 2:] = float("nan")
-    i_star[0, 2:] = float("nan")
-
-    total, bd = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-    assert math.isfinite(total.item())
-    assert math.isfinite(bd.A) and math.isfinite(bd.I)
-
-
-# ---------------------------------------------------------------------------
-# Test 4 — per-sample triple counts can differ, including empty
-# ---------------------------------------------------------------------------
-
-
-def test_c_triples_varied_lengths():
-    """Samples with 0 / 1 / k triples all handled cleanly."""
-    loss_mod = _build_heads_and_loss(weighting="uncertainty")
-    logits, y_true, col_emb, o_star, i_star, is_id, _c, d = _fake_batch()
-    c_triples = [
-        [],  # empty
-        [(0, torch.tensor([False, True, False, False]), 0.1)],  # one
-        [  # several
-            (0, torch.tensor([False, True, False, False]), 0.1),
-            (1, torch.tensor([True, False, False, False]), 0.2),
-            (2, torch.tensor([True, True, False, False]), 0.05),
-        ],
-    ]
-    total, bd = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-    assert math.isfinite(total.item())
-    assert bd.C >= 0
-
-    # All-empty triples: C loss is exactly 0.
-    c_all_empty = [[], [], []]
-    _, bd0 = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_all_empty, d)
-    assert bd0.C == 0.0
-
-
-# ---------------------------------------------------------------------------
-# Test 5 — manual lambda override
-# ---------------------------------------------------------------------------
-
-
-def test_manual_lambdas_override():
-    """'manual' weighting uses user-supplied lambdas and no log_sigma."""
-    loss_mod = _build_heads_and_loss(
-        weighting="manual",
-        lambdas={"pred": 2.0, "obs": 0.5, "int": 0.25, "cond": 0.125},
+    all_nan = torch.full((H,), float("nan"))
+    query = ValueQuery(
+        S_mask=torch.zeros(H, dtype=torch.bool),
+        targets=all_nan,
+        raw_targets=None,
+        query_type="empty",
     )
-    assert not hasattr(loss_mod, "log_sigma2") or "log_sigma2" not in dict(loss_mod.named_parameters())
-
-    logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d = _fake_batch()
-    total, bd = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-
-    assert bd.w_pred == 2.0
-    assert bd.w_A == 0.5
-    assert bd.w_I == 0.25
-    assert bd.w_C == 0.125
-
-    # Total approximately equals the weighted sum (no uncertainty reg term).
-    expected = 2.0 * bd.pred + 0.5 * bd.A + 0.25 * bd.I + 0.125 * bd.C
-    assert math.isclose(total.item(), expected, rel_tol=1e-4, abs_tol=1e-5)
+    labels = [{"value_queries": [query], "y_var_raw": 1.0, "label_scale": "rms_y_units"}]
+    _, bd = loss_fn(logits, y_true, col_emb, labels, d)
+    assert bd.value == 0.0
 
 
-# ---------------------------------------------------------------------------
-# Test 6 — consistency penalty couples Head A and Head C
-# ---------------------------------------------------------------------------
+def test_strata_diagnostics_populated():
+    B, T_test, C, H, E = 2, 2, 3, 4, 8
+    loss_fn = _build_loss(embed_dim=E)
+    logits = torch.randn(B, T_test, C)
+    y_true = torch.randint(0, C, (B, T_test))
+    col_emb = torch.randn(B, H, E)
+    d = torch.tensor([H, H])
+    labels = _make_labels(B, p=H, n_queries=2)
+    _, bd = loss_fn(logits, y_true, col_emb, labels, d)
+    assert not (bd.value_empty != bd.value_empty), "value_empty stratum should be populated"
+    assert not (bd.value_singleton != bd.value_singleton), "value_singleton stratum should be populated"
 
 
-def test_consistency_penalty_when_enabled():
-    """With cons_weight>0, perturbing head_c weights changes the total."""
-    loss_mod = _build_heads_and_loss(
+def test_manual_weighting_respects_lambdas():
+    loss_fn = PredictiveValueLoss(
+        value_head=ConditionalPredictiveValueHead(embed_dim=8),
         weighting="manual",
-        lambdas={"pred": 0.0, "obs": 0.0, "int": 0.0, "cond": 0.0},
-        head_c_consistency_weight=1.0,
+        lambdas={"pred": 0.0, "value": 1.0},
     )
-    logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d = _fake_batch()
-
-    total_before, bd_before = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-    assert bd_before.cons > 0
-
-    with torch.no_grad():
-        loss_mod.head_c.fc2.weight.add_(0.5)
-    total_after, bd_after = loss_mod(logits, y_true, col_emb, o_star, i_star, is_id, c_triples, d)
-    assert not math.isclose(total_before.item(), total_after.item(), rel_tol=1e-6)
-
-    # Consistency penalty backprops into both head_a and head_c.
-    loss_mod.zero_grad()
-    total_after.backward()
-    assert loss_mod.head_a.mlp.fc2.weight.grad is not None
-    assert loss_mod.head_c.fc2.weight.grad is not None
+    logits = torch.randn(1, 2, 3)
+    y_true = torch.randint(0, 3, (1, 2))
+    col_emb = torch.randn(1, 4, 8)
+    d = torch.tensor([4])
+    labels = _make_labels(1, p=4)
+    total, bd = loss_fn(logits, y_true, col_emb, labels, d)
+    # With lambda_pred=0, total == value * 1 (no regulariser under manual).
+    assert abs(total.item() - bd.value) < 1e-5
