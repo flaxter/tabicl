@@ -1,484 +1,201 @@
-"""Phase 3 — closed-form + Monte-Carlo attribution-label computation.
+"""Conditional predictive value labels.
 
-Given an SCM instance and a pre-``Reg2Cls`` ``(X, y)`` sample from it, we
-compute three attribution-label tensors per dataset:
+The central label is
 
-- ``o_star``:       Head A labels, shape ``(p,)``, in ``Var(continuous_y)`` units.
-- ``i_star``:       Head I labels, shape ``(p,)``, in ``continuous_y`` units.
-                    All-NaN on non-identifiable samplers.
-- ``c_triples``:    ``k = min(p, 16)`` sampled ``(i, S_mask, c_star)`` triples
-                    for Head C. Not an all-pairs matrix.
+    Delta_{i|S} = V(S union {i}) - V(S),   V(S) = Var(E[Y | X_S]),
 
-The dispatch is:
+the reduction in Bayes squared-error risk from revealing X_i once X_S is
+known. Labels are computed from the generator/oracle, not from the finite
+PFN context. The neural target is RMS-scale:
 
-- ``LiNGAMSCM``      → covariance algebra (all three heads closed form).
-- ``ANMSCM``         → MC on structural equations (A: ``Var(E[y|...])`` via
-                       grouping fresh noise; I: ``do(X_i = x)``; C: as A).
-- ``TreeSCM_Ident``  → MC on cached structural equations.
-- ``MLPSCM``         → fresh-noise MC only for A / C; ``is_identifiable=False``.
-- ``TreeSCM``        → fresh-noise MC only for A / C; ``is_identifiable=False``.
+    r_{i|S} = sqrt(max(Delta_{i|S}, 0))        (units of Y).
 
-Labels are tied to ``continuous_y`` (the outcome *before* ``Reg2Cls``). Phase
-4's loss has to know this — see ``notes/PHASE3.md`` §Risks.
+Two label paths:
+
+- ``V_gaussian(Sigma, y_idx, S)`` — exact closed form under joint
+  Gaussianity. Used by unit-test fixtures and (optionally) a dedicated
+  linear-Gaussian subprior. Exactness requires the joint (X, Y) to be
+  Gaussian; it is **not** the Bayes value for non-Gaussian linear SCMs —
+  only the best-linear-projection value. Use the simulator-oracle path for
+  anything not jointly Gaussian.
+
+- ``compute_value_queries(scm, X, y, params, rng)`` — simulator-oracle
+  plug-in estimator of V(S) via quantile-binning the conditional mean. Used
+  for the primary training priors (MLPSCM, TreeSCM).
+
+Per-dataset label mixture (locked in preregistration §7.2) — 10 conditioning
+states sampled per call:
+
+    | bucket      | count | |S|               |
+    |-------------|-------|-------------------|
+    | empty       | 1     | 0                 |
+    | singleton   | 2     | 1                 |
+    | small       | 3     | uniform{2,3,4}    |
+    | medium      | 2     | floor(p/2)        |
+    | near_full   | 2     | uniform{p-2,p-1}  |
+
+For each sampled S, targets are computed for all i in [p]; NaN for i in S.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from .identifiable_scm import ANMSCM, LiNGAMSCM, TreeSCM_Ident
-
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public datatypes
 # ---------------------------------------------------------------------------
 
 
-def compute_labels(
-    scm: Any,
-    X: Tensor,
-    y: Tensor,
-    params: Optional[Dict[str, Any]] = None,
-    n_mc: int = 2048,
-    k_cond_triples: int = 16,
-    rng: Optional[np.random.Generator] = None,
-    mode: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Compute attribution labels for one pre-``Reg2Cls`` dataset.
+@dataclass
+class ValueQuery:
+    """One conditioning state S and its RMS predictive value targets.
+
+    Attributes
+    ----------
+    S_mask : BoolTensor, shape (p,)
+        True for features in the conditioning set S.
+    targets : Tensor, shape (p,)
+        RMS targets sqrt(max(Delta_{i|S}, 0)). NaN for positions i in S.
+    raw_targets : Tensor, shape (p,) or None
+        Variance-scale Delta_{i|S}. NaN for positions i in S. Optional.
+    query_type : str
+        One of {"empty", "singleton", "small", "medium", "near_full"}. Used
+        for stratified loss diagnostics only.
+    """
+
+    S_mask: Tensor
+    targets: Tensor
+    raw_targets: Optional[Tensor] = None
+    query_type: str = "random"
+
+
+# ---------------------------------------------------------------------------
+# Gaussian closed-form helpers (exact; test fixtures + future subprior)
+# ---------------------------------------------------------------------------
+
+
+def V_gaussian(Sigma: np.ndarray, y_idx: int, S: np.ndarray) -> float:
+    """Return Var(E[Y | X_S]) for jointly Gaussian (X, Y).
+
+    Uses a linear solve, not an explicit inverse. Ridge stabilisation is
+    applied for near-singular Sigma_SS.
 
     Parameters
     ----------
-    scm : object
-        The instantiated SCM that produced ``(X, y)``. Dispatch is by type.
-    X : Tensor, shape (T, p)
-        Continuous features.
-    y : Tensor, shape (T,)
-        Continuous outcome.
-    params : dict, optional
-        Parameters passed to ``generate_dataset``. Used only for defaults.
-    n_mc : int
-        MC sample count for non-closed-form heads.
-    k_cond_triples : int
-        Number of Head-C triples sampled per dataset.
-    rng : np.random.Generator, optional
-    mode : {"closed_form", "mc", "nan"}, optional
-        Overrides the type-based dispatch. ``"nan"`` returns all-NaN labels.
-
-    Returns
-    -------
-    dict with keys ``o_star``, ``i_star``, ``c_triples``, ``is_identifiable``.
+    Sigma : ndarray, shape (p+1, p+1)
+        Joint covariance of (X, Y) with Y at position ``y_idx``.
+    y_idx : int
+        Index of Y in the covariance matrix.
+    S : ndarray of int, shape (|S|,)
+        Feature indices.
     """
-    rng = rng or np.random.default_rng()
-    p = X.shape[-1]
-
-    if mode == "nan":
-        return _nan_labels(p, k_cond_triples)
-
-    if isinstance(scm, LiNGAMSCM):
-        return _labels_lingam(scm, p, k_cond_triples, rng)
-    if isinstance(scm, ANMSCM):
-        return _labels_anm(scm, p, n_mc, k_cond_triples, rng)
-    if isinstance(scm, TreeSCM_Ident):
-        return _labels_tree_ident(scm, p, n_mc, k_cond_triples, rng)
-
-    # Non-identifiable samplers (MLPSCM, TreeSCM): fresh-noise MC for A / C.
-    simulate = getattr(scm, "simulate", None)
-    if callable(simulate):
-        return _labels_mc_non_identifiable(scm, p, n_mc, k_cond_triples, rng)
-
-    return _nan_labels(p, k_cond_triples)
-
-
-# ---------------------------------------------------------------------------
-# NaN fallback
-# ---------------------------------------------------------------------------
-
-
-def _nan_labels(p: int, k_cond_triples: int) -> Dict[str, Any]:
-    return {
-        "o_star": torch.full((p,), float("nan")),
-        "i_star": torch.full((p,), float("nan")),
-        "c_triples": [],
-        "is_identifiable": False,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Head-C triple sampling
-# ---------------------------------------------------------------------------
-
-
-def _sample_c_triples(p: int, k: int, rng: np.random.Generator) -> List[Tuple[int, np.ndarray]]:
-    """Sample ``k`` ``(i, S_mask)`` pairs with ``i`` not in ``S``.
-
-    ``S`` is drawn uniformly from subsets of ``{0..p-1} \\ {i}`` with a
-    uniform |S| between 0 and p-1.
-    """
-    triples: List[Tuple[int, np.ndarray]] = []
-    if p <= 0:
-        return triples
-    for _ in range(k):
-        i = int(rng.integers(0, p))
-        others = np.array([j for j in range(p) if j != i], dtype=int)
-        if others.size == 0:
-            S_mask = np.zeros(p, dtype=bool)
-        else:
-            size = int(rng.integers(0, others.size + 1))
-            if size == 0:
-                S = np.zeros(0, dtype=int)
-            else:
-                S = rng.choice(others, size=size, replace=False)
-            S_mask = np.zeros(p, dtype=bool)
-            S_mask[S] = True
-        triples.append((i, S_mask))
-    return triples
-
-
-# ---------------------------------------------------------------------------
-# LiNGAM closed form (covariance algebra)
-# ---------------------------------------------------------------------------
-
-
-def _labels_lingam(
-    scm: LiNGAMSCM,
-    p: int,
-    k_cond_triples: int,
-    rng: np.random.Generator,
-) -> Dict[str, Any]:
-    C = scm.covariance()  # (p+1, p+1)
-    sig_XX = C[:p, :p]
-    sig_Xy = C[:p, p]
-    var_y = float(C[p, p])
-
-    # Head A per PHASE3.md: o*_i = Var(E[y|X]) - Var(E[y|X_{-i}]).
-    # With the joint covariance ``C`` this is the Schur-complement drop when
-    # feature ``i`` is removed from the full conditioning set.
-    o_star = np.zeros(p)
-    full_idx = np.arange(p)
-    for i in range(p):
-        excl = np.array([j for j in full_idx if j != i])
-        o_star[i] = max(
-            0.0,
-            _explained_var_lin(sig_XX, sig_Xy, full_idx)
-            - _explained_var_lin(sig_XX, sig_Xy, excl),
-        )
-
-    # Head I closed form. Under do(X_i = x), downstream features see a
-    # deterministic shift ``B[:, i] * x`` where ``B = (I - A)^{-1}`` — i.e.,
-    # the total-effect column of ``i``. So
-    #   E[y | do(X_i=x)] - E[y]  =  (B^T beta)_i * x
-    # and i*_i = | (B^T beta)_i | * sd( pi_i ).
-    B = np.linalg.inv(np.eye(p) - scm.A)
-    total_effects = B.T @ scm.beta  # shape (p,)
-    sd_feat = np.sqrt(np.clip(np.diag(sig_XX), 1e-12, None))
-    i_star = np.abs(total_effects) * sd_feat
-
-    c_triples: List[Tuple[int, Tensor, float]] = []
-    for i, S_mask in _sample_c_triples(p, k_cond_triples, rng):
-        gain = _partial_variance_gain(sig_XX, sig_Xy, var_y, i, cond=S_mask)
-        c_triples.append((i, torch.as_tensor(S_mask, dtype=torch.bool), float(gain)))
-
-    return {
-        "o_star": torch.as_tensor(o_star, dtype=torch.float),
-        "i_star": torch.as_tensor(i_star, dtype=torch.float),
-        "c_triples": c_triples,
-        "is_identifiable": True,
-    }
-
-
-def _partial_variance_gain(
-    sig_XX: np.ndarray,
-    sig_Xy: np.ndarray,
-    var_y: float,
-    i: int,
-    cond: np.ndarray,
-) -> float:
-    """Return ``Var(E[y | X_S, X_i]) - Var(E[y | X_S])`` in the joint-Gaussian
-    regression that corresponds to the linear SCM.
-
-    For a multivariate-Gaussian ``(X, y)`` the conditional variance of ``y``
-    given a subset ``T`` is ``var_y - sig_yT sig_TT^{-1} sig_Ty`` — we use
-    this with ``T = S`` and ``T = S ∪ {i}``. The identity is exact under
-    linear-Gaussian; under non-Gaussian LiNGAM noise it remains exact for
-    the *explained-variance* quantity because ``E[y | T]`` in the
-    best-linear-predictor sense is still linear.
-    """
-    S_idx = np.flatnonzero(cond)
-    S_plus = np.concatenate([S_idx, np.array([i])])
-
-    expl_S = _explained_var_lin(sig_XX, sig_Xy, S_idx)
-    expl_Si = _explained_var_lin(sig_XX, sig_Xy, S_plus)
-    return float(max(0.0, expl_Si - expl_S))
-
-
-def _explained_var_lin(sig_XX: np.ndarray, sig_Xy: np.ndarray, T_idx: np.ndarray) -> float:
-    """``Var(E[y | X_T])`` for the best-linear predictor of ``y`` given ``X_T``.
-
-    For multivariate-Gaussian ``(X, y)`` this equals
-    ``sig_yT @ sig_TT^{-1} @ sig_Ty``. For non-Gaussian LiNGAM it is still
-    the correct linear-regression R^2 numerator.
-    """
-    if T_idx.size == 0:
+    if S.size == 0:
         return 0.0
-    sig_TT = sig_XX[np.ix_(T_idx, T_idx)]
-    sig_yT = sig_Xy[T_idx]
-    # Ridge-stabilise the inverse for near-singular configurations.
-    try:
-        sol = np.linalg.solve(sig_TT + 1e-10 * np.eye(T_idx.size), sig_yT)
-    except np.linalg.LinAlgError:
-        sol = np.linalg.lstsq(sig_TT, sig_yT, rcond=None)[0]
-    return float(sig_yT @ sol)
+    Sigma_SS = Sigma[np.ix_(S, S)]
+    Sigma_yS = Sigma[y_idx, S]
+    sol = np.linalg.solve(Sigma_SS + 1e-10 * np.eye(S.size), Sigma_yS)
+    return float(Sigma_yS @ sol)
+
+
+def delta_gaussian(Sigma: np.ndarray, y_idx: int, i: int, S: np.ndarray) -> float:
+    """Return Delta_{i|S} = V(S union {i}) - V(S) for jointly Gaussian (X, Y).
+
+    Returns NaN if ``i in S``; nonnegative otherwise (numerical floor at 0).
+    """
+    if int(i) in set(S.tolist()):
+        return float("nan")
+    S_plus = np.concatenate([S, np.array([int(i)])])
+    gain = V_gaussian(Sigma, y_idx, S_plus) - V_gaussian(Sigma, y_idx, S)
+    return float(max(0.0, gain))
 
 
 # ---------------------------------------------------------------------------
-# ANM / TreeSCM_Ident — MC on known structural equations
+# Conditioning-state sampler (locked mixture)
 # ---------------------------------------------------------------------------
 
 
-def _labels_anm(
-    scm: ANMSCM,
+_DEFAULT_MIXTURE: Tuple[Tuple[str, int, str], ...] = (
+    ("empty", 1, "zero"),
+    ("singleton", 2, "one"),
+    ("small", 3, "small"),
+    ("medium", 2, "medium"),
+    ("near_full", 2, "near_full"),
+)
+# Backup (thinned) mixture if label-cost smoketest forces it — 6 states.
+_BACKUP_MIXTURE: Tuple[Tuple[str, int, str], ...] = (
+    ("empty", 1, "zero"),
+    ("singleton", 1, "one"),
+    ("small", 2, "small"),
+    ("medium", 1, "medium"),
+    ("near_full", 1, "near_full"),
+)
+
+
+def _draw_S(p: int, size_spec: str, rng: np.random.Generator) -> np.ndarray:
+    """Sample a feature subset of the specified size-class from [p]."""
+    if p <= 0:
+        return np.zeros(0, dtype=int)
+    if size_spec == "zero":
+        size = 0
+    elif size_spec == "one":
+        size = 1
+    elif size_spec == "small":
+        # Uniform in {2, 3, 4}, truncated to feasible.
+        size = int(rng.integers(2, min(5, max(3, p))))
+    elif size_spec == "medium":
+        size = p // 2
+    elif size_spec == "near_full":
+        # Uniform in {p-2, p-1}, truncated to non-negative.
+        choices = [v for v in (p - 2, p - 1) if v >= 0]
+        size = int(rng.choice(choices))
+    else:
+        raise ValueError(f"Unknown size_spec {size_spec!r}")
+    size = max(0, min(size, p))
+    if size == 0:
+        return np.zeros(0, dtype=int)
+    return rng.choice(p, size=size, replace=False).astype(int)
+
+
+def sample_value_queries_meta(
     p: int,
-    n_mc: int,
-    k_cond_triples: int,
     rng: np.random.Generator,
-) -> Dict[str, Any]:
-    return _labels_mc_identifiable(scm, p, n_mc, k_cond_triples, rng)
-
-
-def _labels_tree_ident(
-    scm: TreeSCM_Ident,
-    p: int,
-    n_mc: int,
-    k_cond_triples: int,
-    rng: np.random.Generator,
-) -> Dict[str, Any]:
-    return _labels_mc_identifiable(scm, p, n_mc, k_cond_triples, rng)
-
-
-def _labels_mc_identifiable(
-    scm: Any,
-    p: int,
-    n_mc: int,
-    k_cond_triples: int,
-    rng: np.random.Generator,
-) -> Dict[str, Any]:
-    """MC label computation that uses the SCM's structural equations directly.
-
-    Requires ``scm.simulate(intervene_on=..., n_samples=..., rng=...)`` and
-    ``scm.mechanism_y`` / ``scm.edge_y`` — i.e., the outcome mechanism must
-    be applied to a provided ``X`` matrix in closed form (no noise) so we
-    can evaluate ``E[y | X]`` at the structural level.
-    """
-    mu_y = _expected_y(scm, _get_feature_matrix(scm, n_mc, rng))
-    var_y = float(np.var(mu_y + scm.noise_dist_y.sample(mu_y.shape[0], rng)))
-
-    # Head A via residual-variance drop: Var(E[y|X]) - Var(E[y|X_{-i}])
-    X_mc = _get_feature_matrix(scm, n_mc, rng)
-    mu_full = _expected_y(scm, X_mc)
-    var_mu_full = float(np.var(mu_full))
-
-    o_star = np.zeros(p)
-    # For each i, estimate Var(E[y|X_{-i}]) by resampling X_i conditional on X_{-i}.
-    # For a strict causal SCM we cannot easily condition on X_{-i}, but
-    # Var(E[y|X_{-i}]) = Var(mu_full) - E[Var(mu_full | X_{-i})] under the
-    # identity Var(A) = Var(E[A|B]) + E[Var(A|B)]. We estimate the
-    # inner-variance term by grouping Monte Carlo: for each base sample we
-    # redraw X_i from its marginal (a *permutation* of the column, which is
-    # a valid sample from the marginal).
-    for i in range(p):
-        X_shuf = X_mc.copy()
-        perm = rng.permutation(n_mc)
-        X_shuf[:, i] = X_mc[perm, i]
-        mu_shuf = _expected_y(scm, X_shuf)
-        # E[Var(mu_full | X_{-i})] ~ 0.5 * E[(mu_full - mu_shuf)^2]
-        #   — this is Sobol's total-effect pick-freeze estimator.
-        # First-order index: o*_i = Var(E[y|X]) - E[Var(E[y|X]|X_{-i})], but
-        # for independent X the PLAN's first-order Sobol reduces to:
-        #   Var(E[y|X_i]).
-        # We use the cheaper estimate
-        #   o*_i = Var(mu_full) - 0.5 * E[(mu_full - mu_shuf)^2]
-        # which equals the PLAN's first-order Sobol under feature
-        # independence, and is a well-behaved proxy under mild dependence.
-        inner = 0.5 * float(np.mean((mu_full - mu_shuf) ** 2))
-        o_star[i] = max(0.0, var_mu_full - inner)
-
-    # Head I via the structural do-operator.
-    i_star = np.zeros(p)
-    n_outer = min(64, max(8, n_mc // 32))
-    X_base = _get_feature_matrix(scm, n_mc, rng)
-    mu_base_mean = float(np.mean(_expected_y(scm, X_base)))
-    for i in range(p):
-        # Sample x-values from pi_i (marginal of X_i) via the simulated column.
-        x_vals = rng.choice(X_base[:, i], size=n_outer, replace=True)
-        diffs = np.zeros(n_outer)
-        for j, x in enumerate(x_vals):
-            X_int, _ = scm.simulate(intervene_on={i: float(x)}, n_samples=n_mc // 4, rng=rng)
-            if isinstance(X_int, torch.Tensor):
-                X_int = X_int.cpu().numpy()
-            mu_int = _expected_y(scm, X_int)
-            diffs[j] = float(np.mean(mu_int)) - mu_base_mean
-        i_star[i] = float(np.sqrt(max(0.0, np.mean(diffs ** 2))))
-
-    # Head C via the same pick-freeze estimator but conditional on S.
-    c_triples: List[Tuple[int, Tensor, float]] = []
-    for i, S_mask in _sample_c_triples(p, k_cond_triples, rng):
-        c_val = _head_c_mc(scm, X_mc, mu_full, i, S_mask, rng)
-        c_triples.append((i, torch.as_tensor(S_mask, dtype=torch.bool), float(c_val)))
-
-    return {
-        "o_star": torch.as_tensor(o_star, dtype=torch.float),
-        "i_star": torch.as_tensor(i_star, dtype=torch.float),
-        "c_triples": c_triples,
-        "is_identifiable": True,
-    }
-
-
-def _head_c_mc(
-    scm: Any,
-    X_mc: np.ndarray,
-    mu_full: np.ndarray,
-    i: int,
-    S_mask: np.ndarray,
-    rng: np.random.Generator,
-) -> float:
-    """Sobol-style conditional-contribution estimator.
-
-    Freezing X_S and resampling X_{not in S ∪ {i}} + X_i gives
-    E[Var(mu | X_S)]; additionally freezing X_i then gives
-    E[Var(mu | X_S, X_i)]. Their difference is Head C.
-    """
-    n = X_mc.shape[0]
-    # E[Var(mu | X_S)] ≈ 0.5 * E[(mu_full - mu_shuf_notS)^2]
-    mask_notS = ~S_mask
-    X_shuf_notS = X_mc.copy()
-    perm = rng.permutation(n)
-    X_shuf_notS[:, mask_notS] = X_mc[np.ix_(perm, mask_notS)]
-    mu_shuf_notS = _expected_y(scm, X_shuf_notS)
-    var_given_S = 0.5 * float(np.mean((mu_full - mu_shuf_notS) ** 2))
-
-    # E[Var(mu | X_S ∪ {i})] ≈ 0.5 * E[(mu_full - mu_shuf_notSi)^2]
-    mask_notSi = mask_notS.copy()
-    mask_notSi[i] = False
-    X_shuf_notSi = X_mc.copy()
-    perm2 = rng.permutation(n)
-    X_shuf_notSi[:, mask_notSi] = X_mc[np.ix_(perm2, mask_notSi)]
-    mu_shuf_notSi = _expected_y(scm, X_shuf_notSi)
-    var_given_Si = 0.5 * float(np.mean((mu_full - mu_shuf_notSi) ** 2))
-
-    return max(0.0, var_given_S - var_given_Si)
-
-
-def _expected_y(scm: Any, X: np.ndarray) -> np.ndarray:
-    """Return ``E[y | X] = f_y(X)`` evaluated in closed form (no noise).
-
-    We dispatch on the SCM type to pick the noise-free outcome mechanism.
-    """
-    if isinstance(scm, LiNGAMSCM):
-        return X @ scm.beta
-    if isinstance(scm, ANMSCM):
-        return scm.mechanism_y(X)
-    if isinstance(scm, TreeSCM_Ident):
-        return scm.edge_y(X[:, scm.y_parent])
-    raise TypeError(f"No noise-free outcome mechanism for {type(scm).__name__}")
-
-
-def _get_feature_matrix(scm: Any, n: int, rng: np.random.Generator) -> np.ndarray:
-    """Fresh-noise simulation of X to feed into ``_expected_y``."""
-    X, _ = scm.simulate(n_samples=n, rng=rng)
-    if isinstance(X, torch.Tensor):
-        X = X.cpu().numpy()
-    return X
+    mixture: str = "default",
+) -> List[Tuple[np.ndarray, str]]:
+    """Return a list of ``(S, query_type)`` pairs sampled from the mixture."""
+    spec = _DEFAULT_MIXTURE if mixture == "default" else _BACKUP_MIXTURE
+    out: List[Tuple[np.ndarray, str]] = []
+    for query_type, count, size_spec in spec:
+        for _ in range(count):
+            S = _draw_S(p, size_spec, rng)
+            out.append((S, query_type))
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Non-identifiable fallback (MLPSCM / TreeSCM): fresh-noise MC for A / C only
+# Simulator-oracle V(S) via quantile-binning plug-in
 # ---------------------------------------------------------------------------
-
-
-def _labels_mc_non_identifiable(
-    scm: Any,
-    p: int,
-    n_mc: int,
-    k_cond_triples: int,
-    rng: np.random.Generator,
-) -> Dict[str, Any]:
-    """MC labels for samplers with no tractable noiseless outcome mechanism.
-
-    MLP-SCM and TreeSCM expose ``simulate()`` but every rerun injects
-    independent additive noise, so we can't evaluate ``E[y | X]`` in closed
-    form the way we do for the identifiable families. As a fallback we use
-    a plug-in estimator of ``Var(E[y | X_T])`` via feature binning:
-
-    1. Sample one fresh batch of ``(X, y)`` from the SCM.
-    2. For each target subset ``T``, bin the feature vectors ``X[:, T]``
-       (each column into ``n_bins`` quantile buckets; combined subset bin
-       index is a tuple hash) and take the variance of the per-bin mean
-       of ``y``. This is a consistent estimator of ``Var(E[y | X_T])``
-       as both the sample size and bin count grow.
-
-    Head I is always NaN here — the plan explicitly tags these samplers as
-    non-identifiable.
-    """
-    sim = scm.simulate
-    X_base, y_base = sim(n_samples=n_mc, rng=rng)
-    if isinstance(X_base, torch.Tensor):
-        X_base = X_base.cpu().numpy()
-        y_base = y_base.cpu().numpy()
-
-    n_bins = 10
-    # Pre-bin every column once.
-    col_bins = np.stack(
-        [_quantile_bin(X_base[:, j], n_bins=n_bins) for j in range(p)], axis=1
-    )
-
-    var_all = _binned_explained_var(col_bins, y_base, np.arange(p))
-    o_star = np.zeros(p)
-    for i in range(p):
-        o_star[i] = max(0.0, _binned_explained_var(col_bins, y_base, np.array([i])))
-
-    c_triples: List[Tuple[int, Tensor, float]] = []
-    for i, S_mask in _sample_c_triples(p, k_cond_triples, rng):
-        S_idx = np.flatnonzero(S_mask)
-        Si_idx = np.concatenate([S_idx, np.array([i])])
-        vS = _binned_explained_var(col_bins, y_base, S_idx) if S_idx.size > 0 else 0.0
-        vSi = _binned_explained_var(col_bins, y_base, Si_idx)
-        c_val = max(0.0, vSi - vS)
-        c_triples.append((i, torch.as_tensor(S_mask, dtype=torch.bool), float(c_val)))
-
-    return {
-        "o_star": torch.as_tensor(o_star, dtype=torch.float),
-        "i_star": torch.full((p,), float("nan")),
-        "c_triples": c_triples,
-        "is_identifiable": False,
-    }
 
 
 def _quantile_bin(x: np.ndarray, n_bins: int) -> np.ndarray:
-    """Bin a column into ``n_bins`` quantile buckets, returning integer codes."""
     edges = np.quantile(x, np.linspace(0, 1, n_bins + 1))
     edges[0] -= 1e-9
     edges[-1] += 1e-9
     return np.clip(np.searchsorted(edges, x) - 1, 0, n_bins - 1)
 
 
-def _binned_explained_var(col_bins: np.ndarray, y: np.ndarray, T_idx: np.ndarray) -> float:
-    """Plug-in ``Var(E[y | X_T])`` from feature-bin tuples.
-
-    ``col_bins`` is ``(n, p)`` int; ``T_idx`` is the feature subset. We hash
-    each row's bins-tuple to a single integer, compute mean y per key, and
-    return the (sample-size weighted) variance of those means.
-    """
-    if T_idx.size == 0:
+def _binned_V(col_bins: np.ndarray, y: np.ndarray, S: np.ndarray) -> float:
+    """Plug-in estimator of Var(E[Y | X_S]) from pre-binned columns."""
+    if S.size == 0:
         return 0.0
-    keys = col_bins[:, T_idx]
-    # Encode multi-dim bin tuple as single int.
+    keys = col_bins[:, S]
     flat = np.zeros(keys.shape[0], dtype=np.int64)
     for col in range(keys.shape[1]):
         flat = flat * 10 + keys[:, col]
-    # Grouped mean.
     order = np.argsort(flat)
     sorted_flat = flat[order]
     sorted_y = y[order]
@@ -486,5 +203,126 @@ def _binned_explained_var(col_bins: np.ndarray, y: np.ndarray, T_idx: np.ndarray
     groups = np.split(sorted_y, split)
     means = np.array([float(np.mean(g)) for g in groups])
     counts = np.array([g.size for g in groups], dtype=np.float64)
-    overall = float(np.sum(means * counts) / counts.sum())
-    return float(np.sum(counts * (means - overall) ** 2) / counts.sum())
+    total = counts.sum()
+    if total <= 0:
+        return 0.0
+    overall = float(np.sum(means * counts) / total)
+    return float(np.sum(counts * (means - overall) ** 2) / total)
+
+
+# ---------------------------------------------------------------------------
+# Top-level label entry point
+# ---------------------------------------------------------------------------
+
+
+def compute_value_queries(
+    scm: Any,
+    X: Tensor,
+    y: Tensor,
+    params: Optional[Dict[str, Any]] = None,
+    n_oracle: int = 512,
+    rng: Optional[np.random.Generator] = None,
+    mode: Optional[str] = None,
+    mixture: str = "default",
+    n_bins: int = 10,
+) -> Dict[str, Any]:
+    """Compute predictive value query labels for one pre-``Reg2Cls`` dataset.
+
+    Simulator-oracle plug-in estimator of V(S) via quantile-binning: one
+    fresh-noise MC draw of (X, y) at size ``n_oracle`` is taken from the
+    SCM; each feature column is quantile-binned once; V(S) is the
+    weighted variance of the per-bin mean of y over the bin-tuple keyed by
+    ``X[:, S]``.
+
+    Parameters
+    ----------
+    scm : object
+        SCM instance exposing ``simulate(n_samples, rng)``.
+    X, y : Tensor
+        The original training (X, y) from this dataset. Used only for
+        feature-count; the oracle draws a fresh sample.
+    params : dict, optional
+        Generation parameters (unused here; reserved for subprior
+        specialisation).
+    n_oracle : int, default=512
+        MC sample count for the oracle draw.
+    rng : np.random.Generator, optional
+    mode : {"nan"}, optional
+        If ``"nan"``, return a single empty NaN query (fallback for priors
+        with no usable ``simulate``).
+    mixture : {"default", "backup"}
+        Conditioning-state mixture (§7.2 locked default, thinned backup).
+    n_bins : int
+        Quantile bins per feature for the plug-in estimator.
+
+    Returns
+    -------
+    dict with keys:
+      ``value_queries`` : list[ValueQuery]
+      ``y_var_raw``     : float, total outcome variance (oracle draw)
+      ``label_scale``   : str, ``"rms_y_units"``
+    """
+    rng = rng if rng is not None else np.random.default_rng()
+    p = int(X.shape[-1])
+
+    if p == 0 or mode == "nan" or not hasattr(scm, "simulate"):
+        return _empty_value_labels(p)
+
+    X_base, y_base = scm.simulate(n_samples=n_oracle, rng=rng)
+    if isinstance(X_base, torch.Tensor):
+        X_base = X_base.cpu().numpy()
+    if isinstance(y_base, torch.Tensor):
+        y_base = y_base.cpu().numpy()
+    X_base = np.asarray(X_base, dtype=np.float64)
+    y_base = np.asarray(y_base, dtype=np.float64).reshape(-1)
+
+    if X_base.ndim != 2 or X_base.shape[1] != p:
+        return _empty_value_labels(p)
+
+    y_var = float(np.var(y_base))
+
+    col_bins = np.stack(
+        [_quantile_bin(X_base[:, j], n_bins=n_bins) for j in range(p)], axis=1
+    )
+
+    queries: List[ValueQuery] = []
+    all_feats = np.arange(p, dtype=int)
+    for S, query_type in sample_value_queries_meta(p, rng, mixture=mixture):
+        V_S = _binned_V(col_bins, y_base, S)
+        targets = np.full(p, np.nan, dtype=np.float64)
+        raw = np.full(p, np.nan, dtype=np.float64)
+        S_set = set(int(j) for j in S.tolist())
+        for i in all_feats:
+            if int(i) in S_set:
+                continue
+            Si = np.concatenate([S, np.array([int(i)])])
+            V_Si = _binned_V(col_bins, y_base, Si)
+            delta = max(0.0, V_Si - V_S)
+            raw[i] = delta
+            targets[i] = float(np.sqrt(delta))
+        S_mask = torch.zeros(p, dtype=torch.bool)
+        if S.size > 0:
+            S_mask[torch.as_tensor(S, dtype=torch.long)] = True
+        queries.append(
+            ValueQuery(
+                S_mask=S_mask,
+                targets=torch.as_tensor(targets, dtype=torch.float),
+                raw_targets=torch.as_tensor(raw, dtype=torch.float),
+                query_type=query_type,
+            )
+        )
+
+    return {
+        "value_queries": queries,
+        "y_var_raw": y_var,
+        "label_scale": "rms_y_units",
+    }
+
+
+def _empty_value_labels(p: int) -> Dict[str, Any]:
+    """Return an empty label payload for degenerate datasets."""
+    return {
+        "value_queries": [],
+        "y_var_raw": float("nan"),
+        "label_scale": "rms_y_units",
+    }
