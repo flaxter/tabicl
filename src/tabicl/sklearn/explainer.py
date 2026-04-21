@@ -300,8 +300,9 @@ class TabICLExplainer(BaseEstimator):
         X_dummy_test = np.zeros((1, h_filtered), dtype=np.float32)
         X_cat = np.concatenate([X_train_filtered, X_dummy_test], axis=0)[None, ...]
 
-        X_t = torch.from_numpy(X_cat).to(self._device)
-        y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device)
+        trunk_dtype = next(model.parameters()).dtype
+        X_t = torch.from_numpy(X_cat).to(self._device, dtype=trunk_dtype)
+        y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device, dtype=trunk_dtype)
 
         inference_config = getattr(self.base_estimator_, "inference_config_", None)
 
