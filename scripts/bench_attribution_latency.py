@@ -59,11 +59,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import signal
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -78,36 +76,45 @@ from tabicl.model.heads import (
 
 
 # --------------------------------------------------------------------------
-# Timeout helper (SIGALRM — POSIX only; arc is Linux, so fine)
+# Timeout helper
+#
+# SIGALRM-based interrupt was unreliable under SLURM: on arc a 300 s cap
+# around ``shap.KernelExplainer.shap_values`` did not fire even after
+# several hundred seconds past the alarm. The root cause is hard to pin
+# down (possibly GIL-release patterns inside KernelSHAP's inner NumPy
+# loops), so we side-step it: we wrap the base estimator's
+# ``predict_proba`` to raise ``_Timeout`` *from the next call* once the
+# wall-clock cap is exceeded. KernelSHAP invokes ``predict_proba`` many
+# times per ``shap_values`` call, so the cap trips within one inner-loop
+# iteration — usually a small fraction of a second after the cap.
 # --------------------------------------------------------------------------
 
 
-class _Timeout(Exception):
-    pass
-
-
-def _timeout_handler(signum, frame):
-    raise _Timeout()
-
-
-@contextmanager
-def _wallclock_cap(seconds: Optional[int]):
-    """Raise ``_Timeout`` if the protected block runs longer than ``seconds``.
-
-    ``seconds=None`` or ``<= 0`` disables the cap. Uses SIGALRM so a
-    long-running C/NumPy loop in KernelSHAP will still be interrupted
-    between Python bytecodes.
+class _Timeout(BaseException):
+    """Subclass of ``BaseException`` so a broad ``except Exception:`` in
+    shap / numba / torch cannot swallow the cap and keep the
+    predict_proba loop running past the wall-clock limit.
     """
-    if not seconds or seconds <= 0:
-        yield
-        return
-    prev = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(int(seconds))
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, prev)
+
+
+def _capped_predict_proba(
+    base, start_time: float, cap_s: Optional[int]
+) -> Callable:
+    """Return a ``predict_proba``-shaped callable that enforces a cap.
+
+    Raises :class:`_Timeout` on the first invocation after
+    ``time.perf_counter() - start_time > cap_s``. ``cap_s=None`` or
+    ``<= 0`` disables the cap.
+    """
+    if not cap_s or cap_s <= 0:
+        return base.predict_proba
+
+    def _wrapped(X):
+        if time.perf_counter() - start_time > cap_s:
+            raise _Timeout()
+        return base.predict_proba(X)
+
+    return _wrapped
 
 
 # --------------------------------------------------------------------------
@@ -282,14 +289,14 @@ def _run_cell(
             )
             continue
 
-        ks = shap.KernelExplainer(base_for_shap.predict_proba, background)
         t0 = time.perf_counter()
+        capped = _capped_predict_proba(base_for_shap, t0, time_cap_s)
+        ks = shap.KernelExplainer(capped, background)
         timed_out = False
         notes = ""
         try:
-            with _wallclock_cap(time_cap_s):
-                # silent=True suppresses shap's tqdm bar under SLURM.
-                ks.shap_values(X_explain, nsamples=ns, silent=True)
+            # silent=True suppresses shap's tqdm bar under SLURM.
+            ks.shap_values(X_explain, nsamples=ns, silent=True)
         except _Timeout:
             timed_out = True
             notes = f"exceeded {time_cap_s}s cap"
