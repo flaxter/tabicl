@@ -23,10 +23,10 @@ from tqdm import tqdm
 import wandb
 
 from tabicl.model.tabicl import TabICL
-from tabicl.model.heads import ConditionalHead, InterventionalHead, ObservationalHead
+from tabicl.model.heads import ConditionalPredictiveValueHead
 from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
-from tabicl.train.multi_task_loss import MultiTaskLoss
+from tabicl.train.multi_task_loss import PredictiveValueLoss
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
 
@@ -246,12 +246,10 @@ class Trainer:
         self.trunk_params = list(self.raw_model.parameters())
 
     def build_attribution_heads(self, model: TabICL) -> None:
-        """Phase 4: attach the three attribution heads + multi-task loss.
+        """Attach the conditional predictive value head + prediction+value loss.
 
-        Heads are plain ``nn.Module``s that consume
-        ``model(return_column_embeddings=True)``'s second return value.
-        ``MultiTaskLoss`` owns them so a single ``loss.backward()`` covers
-        trunk + heads + learned log-sigmas.
+        ``PredictiveValueLoss`` owns the head so a single ``loss.backward()``
+        covers trunk + head + learned log-sigmas.
         """
         if not getattr(self.config, "multi_task_enabled", False):
             self.loss_fn = None
@@ -259,22 +257,19 @@ class Trainer:
 
         embed_dim = self.config.embed_dim
         hidden = self.config.head_embed_dim or None
-        head_a = ObservationalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
-        head_i = InterventionalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
-        head_c = ConditionalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
+        value_head = ConditionalPredictiveValueHead(
+            embed_dim=embed_dim, hidden_dim=hidden
+        ).to(self.config.device)
 
         lambdas = {
             "pred": self.config.lambda_pred,
-            "obs": self.config.lambda_obs,
-            "int": self.config.lambda_int,
-            "cond": self.config.lambda_cond,
+            "value": getattr(self.config, "lambda_value", 1.0),
         }
-        self.loss_fn = MultiTaskLoss(
-            head_a=head_a, head_i=head_i, head_c=head_c,
+        self.loss_fn = PredictiveValueLoss(
+            value_head=value_head,
             weighting=self.config.multi_task_weighting,
             lambdas=lambdas,
             huber_delta=self.config.huber_delta,
-            head_c_consistency_weight=self.config.head_c_consistency_weight,
         ).to(self.config.device)
 
     def configure_prior(self):
@@ -431,13 +426,11 @@ class Trainer:
             "scheduler_state": self.scheduler.state_dict(),
             "curr_step": self.curr_step,
         }
-        # Phase 5: persist attribution-head state so TabICLExplainer can
-        # reconstruct the heads without re-running training.
+        # Persist value-head state so TabICLExplainer can reconstruct it
+        # without re-running training.
         if getattr(self, "loss_fn", None) is not None:
             checkpoint["heads"] = {
-                "observational": self.loss_fn.head_a.state_dict(),
-                "interventional": self.loss_fn.head_i.state_dict(),
-                "conditional": self.loss_fn.head_c.state_dict(),
+                "value": self.loss_fn.value_head.state_dict(),
                 "config": {
                     "embed_dim": self.config.embed_dim,
                     "hidden_dim": self.config.head_embed_dim,
@@ -620,8 +613,9 @@ class Trainer:
         micro_batch : tuple
             Either a 5-tuple ``(X, y, d, seq_len, train_size)`` (original
             TabICL signature; preserved for ``multi_task_enabled=False``) or a
-            9-tuple with the four Phase 3 label outputs appended:
-            ``(X, y, d, seq_len, train_size, o_star, i_star, is_id, c_triples)``.
+            6-tuple ``(X, y, d, seq_len, train_size, labels)`` where
+            ``labels`` is a ``list[dict]`` of per-dataset value-query
+            payloads.
 
         micro_batch_idx : int
             Index of the current micro batch.
@@ -633,18 +627,16 @@ class Trainer:
         -------
         dict
             Metrics for logging: at minimum ``ce`` and ``accuracy``; with
-            multi-task training, also ``loss_A``, ``loss_I``, ``loss_C``,
-            ``loss_cons`` and their weights.
+            value-oracle training, also ``loss_value`` plus per-stratum
+            diagnostics and the two task weights.
         """
-        has_labels = len(micro_batch) == 9
+        has_labels = len(micro_batch) == 6
         if has_labels:
             (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size,
-             micro_o, micro_i, micro_is_id, micro_c_triples) = micro_batch
+             micro_labels) = micro_batch
         else:
             (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size) = micro_batch
-            micro_o = micro_i = None
-            micro_is_id = None
-            micro_c_triples = None
+            micro_labels = None
 
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
@@ -653,10 +645,6 @@ class Trainer:
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
-        if has_labels:
-            micro_o = micro_o.to(self.config.device)
-            micro_i = micro_i.to(self.config.device)
-            micro_is_id = micro_is_id.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -675,8 +663,7 @@ class Trainer:
                 total_loss, bd = self.loss_fn(
                     logits=logits, y_true=y_test,
                     col_emb=col_emb,
-                    o_star=micro_o, i_star=micro_i,
-                    is_id=micro_is_id, c_triples=micro_c_triples,
+                    labels=micro_labels,
                     d=micro_d,
                 )
                 pred = logits.flatten(end_dim=-2)
@@ -697,14 +684,14 @@ class Trainer:
             micro_results = {"ce": (bd.pred if bd else scaled_loss.item())}
             if bd is not None:
                 micro_results["loss_total"] = scaled_loss.item()
-                micro_results["loss_A"] = bd.A / num_micro_batches
-                micro_results["loss_I"] = bd.I / num_micro_batches
-                micro_results["loss_C"] = bd.C / num_micro_batches
-                micro_results["loss_cons"] = bd.cons / num_micro_batches
+                micro_results["loss_value"] = bd.value / num_micro_batches
+                micro_results["loss_value_empty"] = bd.value_empty
+                micro_results["loss_value_singleton"] = bd.value_singleton
+                micro_results["loss_value_small"] = bd.value_small
+                micro_results["loss_value_medium"] = bd.value_medium
+                micro_results["loss_value_near_full"] = bd.value_near_full
                 micro_results["w_pred"] = bd.w_pred
-                micro_results["w_A"] = bd.w_A
-                micro_results["w_I"] = bd.w_I
-                micro_results["w_C"] = bd.w_C
+                micro_results["w_value"] = bd.w_value
                 micro_results["ce"] = bd.pred / num_micro_batches
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
@@ -745,8 +732,8 @@ class Trainer:
         ]
 
         # Split the batch into micro-batches along the first dimension.
-        # Phase 4's 9-tuple carries a Python list for `c_triples`, which is
-        # not torch-splittable — slice it explicitly by row indices.
+        # The labels element (when present) is a Python list, not a tensor,
+        # so it needs row-index slicing instead of torch.split.
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
         mbs = self.config.micro_batch_size
 
