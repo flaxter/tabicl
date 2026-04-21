@@ -575,7 +575,7 @@ class SCMPrior(Prior):
                     y_raw,
                     params=params,
                     n_oracle=params.get("label_n_oracle", 512),
-                    mixture=params.get("label_mixture", "default"),
+                    mixture=params.get("label_mixture", "backup"),
                     mode=mode,
                 )
             else:

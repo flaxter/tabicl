@@ -27,6 +27,10 @@ DEFAULT_FIXED_HP = {
         "mlp_scm": "mc",
         "tree_scm": "mc",
     },
+    # Activated 2026-04-21 after Task 9 full bench: default 10-state mixture
+    # exceeded the preregistration §1 500 ms/dataset budget on 12/36 cells;
+    # backup (6 states) is the only preregistered mitigation.
+    "label_mixture": "backup",
 }
 
 DEFAULT_SAMPLED_HP = {
