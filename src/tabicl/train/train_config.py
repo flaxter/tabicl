@@ -236,6 +236,15 @@ def build_parser():
         "Belt-and-braces guard against rare gradient spikes; default off preserves existing behaviour.",
     )
     parser.add_argument(
+        "--load_model_strict",
+        type=str2bool,
+        default=True,
+        help="Pass strict= to raw_model.load_state_dict(). Default True preserves "
+        "existing behaviour. Set False when loading an upstream v1/v2 checkpoint "
+        "whose output head has a different shape than the Phase-4 multi-task heads "
+        "(e.g. loading v2 regressor weights onto a classifier training config).",
+    )
+    parser.add_argument(
         "--trunk_freeze_steps",
         type=int,
         default=1000,

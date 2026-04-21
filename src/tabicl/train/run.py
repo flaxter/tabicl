@@ -397,7 +397,15 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        self.raw_model.load_state_dict(checkpoint["state_dict"])
+        load_strict = getattr(self.config, "load_model_strict", True)
+        missing, unexpected = self.raw_model.load_state_dict(
+            checkpoint["state_dict"], strict=load_strict
+        )
+        if not load_strict:
+            if missing:
+                print(f"[load_checkpoint] missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}", flush=True)
+            if unexpected:
+                print(f"[load_checkpoint] unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}", flush=True)
 
         # Optionally load optimizer and scheduler state
         if self.config.only_load_model:
