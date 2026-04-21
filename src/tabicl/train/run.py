@@ -5,6 +5,7 @@ import timeit
 import warnings
 import functools
 from contextlib import nullcontext
+from typing import Union
 
 import math
 import numpy as np
@@ -21,7 +22,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
 import wandb
 
-from tabicl import TabICL
+from tabicl.model.tabicl import TabICL
 from tabicl.model.heads import ConditionalHead, InterventionalHead, ObservationalHead
 from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
@@ -170,9 +171,14 @@ class Trainer:
     def build_model(self):
         """Build and initialize the TabICL model."""
 
+        col_feature_group: Union[bool, str] = self.config.col_feature_group
+        if isinstance(col_feature_group, str) and col_feature_group.lower() == "false":
+            col_feature_group = False
+
         self.model_config = {
             "max_classes": self.config.max_classes,
             "embed_dim": self.config.embed_dim,
+            "col_feature_group": col_feature_group,
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
@@ -742,14 +748,14 @@ class Trainer:
         split_parts = [_split_one(t) for t in batch]
         micro_batches = list(zip(*split_parts))
 
-        results = {"ce": 0.0, "accuracy": 0.0}
+        results: dict = {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
 
         for idx, micro_batch in enumerate(micro_batches):
             try:
                 micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
                 for k, v in micro_results.items():
-                    results[k] += v
+                    results[k] = results.get(k, 0.0) + v
             except torch.cuda.OutOfMemoryError:
                 print(
                     f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."

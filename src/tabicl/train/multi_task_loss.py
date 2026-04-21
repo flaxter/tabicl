@@ -160,6 +160,10 @@ class MultiTaskLoss(nn.Module):
     def _head_a_loss(self, col_emb: Tensor, o_star: Tensor, d: Tensor) -> Tuple[Tensor, Tensor]:
         B, H, _ = col_emb.shape
         o_hat = self.head_a(col_emb)
+        # TabICL's col_embedder trims the feature axis to max(d) in the
+        # batch, which can be smaller than the global max_features used to
+        # pad o_star/i_star. Align the label tensor to the trunk's H.
+        o_star = o_star[:, :H]
         mask = _active_feature_mask(d, H) & torch.isfinite(o_star)
         return self._huber_masked(o_hat, o_star, mask), o_hat
 
@@ -172,6 +176,7 @@ class MultiTaskLoss(nn.Module):
     ) -> Tensor:
         B, H, _ = col_emb.shape
         i_hat = self.head_i(col_emb)
+        i_star = i_star[:, :H]
         feat_mask = _active_feature_mask(d, H) & torch.isfinite(i_star)
         # Broadcast identifiability mask over features.
         sample_mask = is_id.to(torch.bool).unsqueeze(-1).expand_as(feat_mask)

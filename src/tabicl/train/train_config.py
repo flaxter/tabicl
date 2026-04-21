@@ -181,6 +181,14 @@ def build_parser():
     parser.add_argument("--col_nhead", type=int, default=4, help="Number of attention heads in column embedder")
     parser.add_argument("--col_num_inds", type=int, default=128, help="Number of inducing points in column embedder")
     parser.add_argument("--freeze_col", default=False, type=str2bool, help="Whether to freeze the column embedder")
+    parser.add_argument(
+        "--col_feature_group",
+        default="same",
+        type=str,
+        help="Feature-grouping mode for col_embedder: 'same' (circular, default), 'valid', or 'false'. "
+        "Phase 4 multi-task training requires 'false' because feature grouping ignores the per-sample "
+        "feature count d, which breaks per-feature attribution head targets.",
+    )
 
     # Row Interaction Config
     parser.add_argument("--row_num_blocks", type=int, default=3, help="Number of blocks in row interactor")
