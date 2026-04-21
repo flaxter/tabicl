@@ -1,14 +1,23 @@
-"""Phase 5 — scikit-learn attribution API.
+"""scikit-learn predictive-oracle API.
 
 Ships :class:`TabICLExplainer`, a thin wrapper around a fitted
-:class:`TabICLClassifier` or :class:`TabICLRegressor` that populates the
-per-feature attribution attributes specified in PLAN §Phase 5:
+:class:`TabICLClassifier` or :class:`TabICLRegressor` that exposes the
+conditional predictive value oracle as sklearn-compatible attributes and
+methods:
 
-- ``observational_relevance_``    — Head A output per original feature
-- ``interventional_effects_``     — Head I output per original feature
-- ``identifiability_scope_``      — string documenting Head I caveats
-- ``marginal_conditional_contributions(S)`` — Head C at conditioning set ``S``
-- ``conditional_relevance_graph(threshold)``  — ``(p, p)`` boolean adjacency
+- :meth:`conditional_predictive_values(S)` — length-``p`` RMS vector of
+  ``sqrt(Delta_{i|S})`` for features not in ``S``. Entries inside ``S``
+  are ``NaN``; entries for features dropped by ``UniqueFeatureFilter``
+  are also ``NaN``.
+- :attr:`predictive_sufficiency_` — cached ``conditional_predictive_values([])``:
+  how useful each feature is **on its own**.
+- :attr:`predictive_necessity_` — batched leave-one-out: entry ``i``
+  estimates ``sqrt(Delta_{i|[p]\\{i}})`` — how much ``X_i`` still adds once
+  every other feature is known.
+- :meth:`greedy_predictive_path(k)` — greedy acquisition path by repeatedly
+  adding the feature with highest predicted value.
+- :meth:`conditional_value_graph(threshold)` — pairwise thresholded graph
+  of ``Delta_{i|{j}}`` edges. **Not a causal graph.**
 
 Attribution is computed from a **single forward pass** of the trunk with
 ``return_column_embeddings=True`` on one canonical (no-shuffle,
@@ -16,20 +25,17 @@ first-norm-method) view of the data. The ensemble path used by
 ``predict``/``predict_proba`` is untouched: prediction continues to go
 through the base estimator's 8-member ensemble.
 
-The three attribution heads are not present in upstream TabICL v1/v2
-checkpoints. Phase 5 requires the caller to supply them either:
+The value head is not present in upstream TabICL v1/v2 checkpoints. The
+caller must supply it either:
 
-1. Directly as ``nn.Module`` instances via ``heads={...}``.
-2. From a checkpoint produced by Phase 4 training via
+1. Directly as an ``nn.Module`` instance via ``value_head=...``.
+2. From a checkpoint produced by training via
    ``heads_checkpoint_path="..."``.
-
-Attribution *quality* is out of scope for Phase 5 — trained head weights
-come from Phase 4, and their evaluation lives in Phase 6.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Sequence, Mapping, Any
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -38,117 +44,60 @@ from torch import nn
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_is_fitted
 
-from tabicl.model.heads import (
-    ObservationalHead,
-    InterventionalHead,
-    ConditionalHead,
-)
-
-
-_IDENTIFIABILITY_DISCLAIMER = (
-    "Head I (interventional_effects_) is trained on the identifiable "
-    "structural subfamily (LiNGAM, ANM, tree-path) from the Phase 3 "
-    "sampler. At inference time the true data-generating process is "
-    "unknown; the returned scores are posterior means under the training "
-    "prior conditioned on the observed context. Interpret them as causal "
-    "do(X_i) effects only if the dataset's DGP plausibly falls inside "
-    "that identifiable family. See notes/PLAN.md section 'What this "
-    "method does and does not fix' for the honest scoping table."
-)
+from tabicl.model.heads import ConditionalPredictiveValueHead
 
 
 class TabICLExplainer(BaseEstimator):
-    """Wrap a fitted TabICL estimator with the Phase 5 attribution API.
-
-    This is the scikit-learn surface that exposes the three attribution
-    heads trained during Phase 4 (observational :math:`o^*_i`,
-    interventional :math:`\\iota^*_i`, conditional :math:`c^*_{i \\mid S}`)
-    without altering the base estimator's prediction contract. Prediction
-    continues to go through ``base_estimator_``'s 8-member ensemble;
-    attribution is computed once on a single canonical view of the data
-    from a single forward pass with ``return_column_embeddings=True``.
-
-    .. warning::
-
-       :meth:`conditional_relevance_graph` returns a thresholded
-       pairwise-Head-C adjacency matrix. It is **not** a causal DAG
-       and must not be interpreted as one. See the method's docstring
-       for the full caveat.
-
-    .. warning::
-
-       :attr:`interventional_effects_` is meaningful only within the
-       Head I identifiability scope (LiNGAM, ANM, tree-SCM). Always
-       read :attr:`identifiability_scope_` before citing these scores
-       as causal effects.
+    """Wrap a fitted TabICL estimator with the conditional predictive value API.
 
     Parameters
     ----------
     base_estimator : TabICLClassifier or TabICLRegressor
         An instance of the base sklearn-compatible TabICL estimator.
-        Can be fitted or unfitted; :meth:`fit` delegates to the base
-        estimator's ``fit``.
-
-    heads : dict[str, nn.Module], optional
-        Pre-built attribution head modules, keyed by
-        ``'observational'``, ``'interventional'``, ``'conditional'``.
-        Mutually exclusive with ``heads_checkpoint_path``.
-
+    value_head : ConditionalPredictiveValueHead, optional
+        The trained value head. Mutually exclusive with
+        ``heads_checkpoint_path``.
     heads_checkpoint_path : str or Path, optional
-        Path to a ``torch.save``'d dict with the format produced by
-        Phase-4 ``Trainer.save_checkpoint`` when multi-task training is
-        enabled:
+        Path to a ``torch.save``'d dict with the format:
 
         .. code-block:: python
 
             {
                 "heads": {
-                    "observational": state_dict,
-                    "interventional": state_dict,
-                    "conditional":   state_dict,
+                    "value": state_dict,
                     "config": {"embed_dim": int, "hidden_dim": int | None},
                 },
                 ...
             }
 
-        The explainer reconstructs the three head modules from ``config``
-        and loads the state dicts.
-
-    device : str, torch.device, or None, default=None
+        The explainer reconstructs the value head from ``config`` and
+        loads its state dict.
+    device : str, torch.device, or None
         Device for attribution-pass compute. If ``None``, inherits from
         ``base_estimator.device_`` (after its ``fit``).
-
-    verbose : bool, default=False
+    verbose : bool
         If True, print progress messages during ``fit``.
 
     Attributes
     ----------
     base_estimator_ : fitted base estimator
-        The fitted base estimator; exact object passed in at ``__init__``.
-    observational_relevance_ : ndarray of shape (n_features_in_,)
-        Head A scores per original input feature. ``NaN`` for features
-        dropped by ``UniqueFeatureFilter`` (single-unique-value columns).
-    interventional_effects_ : ndarray of shape (n_features_in_,)
-        Head I scores per original input feature. Meaningful only within
-        the Head I identifiability scope; see
-        :attr:`identifiability_scope_`.
-    identifiability_scope_ : str
-        Human-readable caveat documenting Head I's identifiability scope.
-        Present as an attribute so users are prompted to read it.
+    predictive_sufficiency_ : ndarray of shape (n_features_in_,)
+        RMS ``sqrt(Delta_{i|empty}) = sqrt(V({i}))``.
+    predictive_necessity_ : ndarray of shape (n_features_in_,)
+        RMS ``sqrt(Delta_{i|[p]\\{i}})``.
     n_features_in_ : int
-        Number of input features at ``fit`` time (pre-unique-filter).
     """
 
     def __init__(
         self,
         base_estimator,
-        heads: Optional[Mapping[str, nn.Module]] = None,
+        value_head: Optional[ConditionalPredictiveValueHead] = None,
         heads_checkpoint_path: Optional[str | Path] = None,
         device: Optional[str | torch.device] = None,
         verbose: bool = False,
     ):
         self.base_estimator = base_estimator
-        self.heads = heads
+        self.value_head = value_head
         self.heads_checkpoint_path = heads_checkpoint_path
         self.device = device
         self.verbose = verbose
@@ -158,31 +107,14 @@ class TabICLExplainer(BaseEstimator):
     # ------------------------------------------------------------------
 
     def fit(self, X, y) -> "TabICLExplainer":
-        """Fit the base estimator, then compute attributions in one pass.
-
-        Steps
-        -----
-        1. Delegate to ``base_estimator.fit(X, y)`` — this loads the
-           pretrained trunk, fits the ensemble generator, and (optionally)
-           builds the KV cache.
-        2. Resolve the three attribution heads from ``self.heads`` or
-           ``self.heads_checkpoint_path``, and move them to the target
-           device in ``eval()`` mode.
-        3. Run a single canonical forward pass with
-           ``return_column_embeddings=True`` to obtain per-feature
-           embeddings of shape ``(1, H_filtered, embed_dim)``.
-        4. Apply Head A and Head I and store the inflated scores.
-        5. Cache the embeddings for on-demand Head C queries.
-        """
+        """Fit the base estimator, cache column embeddings, compute endpoints."""
         self.base_estimator_ = self.base_estimator.fit(X, y)
         self.n_features_in_ = int(self.base_estimator_.n_features_in_)
 
-        self._load_or_check_heads()
+        self._load_or_check_head()
         self._resolve_device()
         self._run_attribution_forward()
-        self._apply_static_heads()
-
-        self.identifiability_scope_ = _IDENTIFIABILITY_DISCLAIMER
+        self._compute_endpoints()
         return self
 
     def predict(self, X) -> np.ndarray:
@@ -201,93 +133,104 @@ class TabICLExplainer(BaseEstimator):
         return self.base_estimator_.predict_proba(X)
 
     # ------------------------------------------------------------------
-    # Attribution queries (Head C)
+    # Public oracle queries
     # ------------------------------------------------------------------
 
-    def marginal_conditional_contributions(
-        self, S: Sequence[int]
-    ) -> np.ndarray:
-        """Head C scores for every feature given a conditioning set ``S``.
+    def conditional_predictive_values(self, S: Sequence[int]) -> np.ndarray:
+        """RMS predictive value at information state ``S``.
+
+        Returns an array of shape ``(n_features_in_,)`` where entry ``i``
+        estimates ``sqrt(Delta_{i|S})`` — the outcome-scale reduction in
+        Bayes squared-error risk from revealing ``X_i`` once ``X_S`` is
+        known. Entries inside ``S`` are ``NaN`` (the query is undefined);
+        entries for features dropped by ``UniqueFeatureFilter`` are also
+        ``NaN``. Predictive, not causal.
+        """
+        check_is_fitted(self, "base_estimator_")
+        S_list = [int(i) for i in S]
+        if any(not (0 <= i < self.n_features_in_) for i in S_list):
+            raise ValueError(
+                f"S must contain indices in [0, n_features_in_={self.n_features_in_}); got {S_list}"
+            )
+
+        mask_filtered = self._filtered_cond_mask(S_list)
+        cond_mask = torch.as_tensor(
+            mask_filtered, dtype=torch.bool, device=self._device
+        ).unsqueeze(0)
+
+        with torch.no_grad():
+            scores_filtered = self.value_head_(
+                self._column_embeddings, cond_mask
+            )  # (1, H_filtered)
+
+        out = self._inflate(scores_filtered.squeeze(0).cpu().numpy().astype(np.float64))
+        for i in S_list:
+            out[i] = np.nan
+        return out
+
+    def greedy_predictive_path(
+        self, k: Optional[int] = None
+    ) -> Tuple[List[int], List[float]]:
+        """Greedy acquisition path by repeated oracle queries.
+
+        Starts at ``S_0 = empty`` and at each step selects
+        ``i_t = argmax_{i not in S_t} Delta_{i|S_t}`` (in RMS units),
+        then sets ``S_{t+1} = S_t union {i_t}``.
 
         Parameters
         ----------
-        S : sequence of int
-            Feature indices (in the **original** input space, pre-filter)
-            that are treated as already revealed. Must be a subset of
-            ``range(n_features_in_)``.
+        k : int, optional
+            Number of features to acquire. ``None`` runs until every
+            non-constant feature is selected.
 
         Returns
         -------
-        ndarray of shape (n_features_in_,)
-            Per-feature Head C scores. Entries inside ``S`` are ``NaN``
-            because asking "what does X_j add given X_j is known" is
-            ill-posed. Entries for features dropped by
-            ``UniqueFeatureFilter`` are also ``NaN``.
+        path : list[int]
+            Selected feature indices in acquisition order (original-space).
+        gains : list[float]
+            Predicted RMS gain at each step.
         """
         check_is_fitted(self, "base_estimator_")
-        S = list(S)
-        if any(not (0 <= int(i) < self.n_features_in_) for i in S):
-            raise ValueError(
-                f"S must contain indices in [0, n_features_in_={self.n_features_in_}); got {S}"
+        keep_mask = self.base_estimator_.ensemble_generator_.unique_filter_.features_to_keep_
+        valid = set(int(i) for i in np.flatnonzero(keep_mask))
+        budget = len(valid) if k is None else min(int(k), len(valid))
+
+        path: List[int] = []
+        gains: List[float] = []
+        S: List[int] = []
+        for _ in range(budget):
+            scores = self.conditional_predictive_values(S)
+            scores_masked = scores.copy()
+            # Only consider features that are in `valid` and not yet in S.
+            candidates = valid - set(S)
+            not_candidate = np.setdiff1d(
+                np.arange(self.n_features_in_), np.fromiter(candidates, dtype=int)
             )
+            scores_masked[not_candidate] = -np.inf
+            if not np.isfinite(scores_masked).any():
+                break
+            i_best = int(np.nanargmax(scores_masked))
+            path.append(i_best)
+            gains.append(float(scores[i_best]))
+            S.append(i_best)
+        return path, gains
 
-        mask_filtered = self._filtered_cond_mask(S)
-        cond_mask = torch.as_tensor(mask_filtered, dtype=torch.bool, device=self._device).unsqueeze(0)
+    def conditional_value_graph(self, threshold: float = 0.1) -> np.ndarray:
+        """Boolean ``(p, p)`` adjacency matrix from pairwise singleton queries.
 
-        with torch.no_grad():
-            scores_filtered = self._head_c(self._column_embeddings, cond_mask)  # (1, H_filtered)
-
-        out = self._inflate(scores_filtered.squeeze(0).cpu().numpy().astype(np.float64))
-        # NaN out entries inside S (in original space)
-        for i in S:
-            out[int(i)] = np.nan
-        return out
-
-    def conditional_relevance_graph(
-        self, threshold: float = 0.1
-    ) -> np.ndarray:
-        """Boolean ``(p, p)`` adjacency matrix thresholding pairwise Head C.
-
-        For every feature pair ``(i, j)`` with ``i != j``, asks Head C
-        "what does ``X_j`` add given ``X_i`` is known" and marks the edge
-        ``(i, j)`` as ``True`` iff that score exceeds ``threshold``.
+        Edge ``(i, j)`` is set iff ``sqrt(Delta_{j|{i}}) > threshold``. The
+        diagonal is ``False``.
 
         .. warning::
 
-           **This is not a causal DAG.** Edges here encode conditional
-           observational relevance: feature ``j`` adds predictive signal
-           beyond ``{X_i}``. They do not encode causal mechanisms,
-           direct-cause edges, or Markov equivalence. Using this graph
-           as a substitute for causal discovery will produce incorrect
-           conclusions. For causal readings use
-           :attr:`interventional_effects_`, subject to the
-           :attr:`identifiability_scope_` caveat, or pipe a
-           causal-discovery front-end.
-
-        Parameters
-        ----------
-        threshold : float, default=0.1
-            Threshold on the Head C score. Edges below the threshold are
-            set to ``False``. Use ``+inf`` for an empty graph, ``-inf``
-            for a complete graph (minus the diagonal).
-
-        Returns
-        -------
-        ndarray of shape (n_features_in_, n_features_in_), dtype=bool
-            Directed adjacency matrix. **Not** a causal DAG — each edge
-            indicates conditional observational relevance, not a causal
-            mechanism. See
-            ``learning-to-explain/notes/PLAN.md`` §Phase 5 key decision
-            #17 for the rationale behind the ``conditional_relevance_graph``
-            name (renamed from the old ``causal_attention_graph`` to
-            prevent this exact confusion).
+           **Not a causal graph.** Edges encode conditional predictive
+           value — feature ``j`` adds predictive signal beyond ``{X_i}``.
+           They do not encode causal mechanisms or direct-cause edges.
         """
         check_is_fitted(self, "base_estimator_")
         p = self.n_features_in_
-        rows = []
-        for i in range(p):
-            rows.append(self.marginal_conditional_contributions([i]))
-        scores = np.stack(rows, axis=0)  # shape (p, p), NaNs at scores[i, i] and filtered positions
+        rows = [self.conditional_predictive_values([i]) for i in range(p)]
+        scores = np.stack(rows, axis=0)  # (p, p)
         with np.errstate(invalid="ignore"):
             graph = scores > threshold
         np.fill_diagonal(graph, False)
@@ -306,32 +249,28 @@ class TabICLExplainer(BaseEstimator):
     # Internals
     # ------------------------------------------------------------------
 
-    def _load_or_check_heads(self) -> None:
-        """Resolve the three attribution heads into ``self._head_{a,i,c}``."""
-        if self.heads is not None and self.heads_checkpoint_path is not None:
+    def _load_or_check_head(self) -> None:
+        if self.value_head is not None and self.heads_checkpoint_path is not None:
             raise ValueError(
-                "Specify at most one of `heads` and `heads_checkpoint_path`."
+                "Specify at most one of `value_head` and `heads_checkpoint_path`."
             )
-        if self.heads is None and self.heads_checkpoint_path is None:
+        if self.value_head is None and self.heads_checkpoint_path is None:
             raise ValueError(
-                "No attribution heads supplied. Pass `heads={...}` with "
-                "ObservationalHead/InterventionalHead/ConditionalHead "
-                "modules, or `heads_checkpoint_path=...` pointing to a "
-                "Phase-4 training checkpoint that persisted the head "
-                "state dicts. Phase 5 is the sklearn surface; training "
-                "the heads is Phase 4's job (see notes/PLAN.md)."
+                "No value head supplied. Pass `value_head=...` with a "
+                "ConditionalPredictiveValueHead module, or "
+                "`heads_checkpoint_path=...` pointing to a training "
+                "checkpoint that persisted the head state dict."
             )
 
-        if self.heads is not None:
-            heads = _validate_heads_dict(self.heads)
-            self._head_a = heads["observational"]
-            self._head_i = heads["interventional"]
-            self._head_c = heads["conditional"]
+        if self.value_head is not None:
+            if not isinstance(self.value_head, nn.Module):
+                raise TypeError(
+                    f"value_head must be an nn.Module, got {type(self.value_head).__name__}"
+                )
+            self.value_head_ = self.value_head
             return
 
-        self._head_a, self._head_i, self._head_c = _load_heads_from_checkpoint(
-            self.heads_checkpoint_path
-        )
+        self.value_head_ = _load_value_head_from_checkpoint(self.heads_checkpoint_path)
 
     def _resolve_device(self) -> None:
         base_device = getattr(self.base_estimator_, "device_", None)
@@ -342,28 +281,24 @@ class TabICLExplainer(BaseEstimator):
         else:
             self._device = torch.device("cpu")
 
-        for head in (self._head_a, self._head_i, self._head_c):
-            head.to(self._device)
-            head.eval()
+        self.value_head_.to(self._device)
+        self.value_head_.eval()
 
     def _run_attribution_forward(self) -> None:
-        """Do one canonical forward pass with per-column embeddings."""
+        """Single canonical forward pass producing per-column embeddings."""
         model = self.base_estimator_.model_
         eg = self.base_estimator_.ensemble_generator_
 
-        # Canonical view: first fitted normalization method, identity shuffle.
         norm_method = next(iter(eg.preprocessors_))
         preprocessor = eg.preprocessors_[norm_method]
 
-        X_train_filtered = np.asarray(preprocessor.X_transformed_, dtype=np.float32)  # (n_train, H_filtered)
-        y_train_np = np.asarray(eg.y_, dtype=np.float32)                                # (n_train,)
+        X_train_filtered = np.asarray(preprocessor.X_transformed_, dtype=np.float32)
+        y_train_np = np.asarray(eg.y_, dtype=np.float32)
 
         n_train, h_filtered = X_train_filtered.shape
 
-        # One dummy test row — column embeddings are mean-pooled over
-        # [:train_size] so the test row has no effect on the embeddings.
         X_dummy_test = np.zeros((1, h_filtered), dtype=np.float32)
-        X_cat = np.concatenate([X_train_filtered, X_dummy_test], axis=0)[None, ...]  # (1, T, H)
+        X_cat = np.concatenate([X_train_filtered, X_dummy_test], axis=0)[None, ...]
 
         X_t = torch.from_numpy(X_cat).to(self._device)
         y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device)
@@ -388,19 +323,37 @@ class TabICLExplainer(BaseEstimator):
             f"Unexpected column-embedding shape {tuple(column_embeddings.shape)}; "
             f"expected (1, {h_filtered}, {model.embed_dim})"
         )
-        self._column_embeddings = column_embeddings.detach()  # (1, H_filtered, E)
+        self._column_embeddings = column_embeddings.detach()
 
-    def _apply_static_heads(self) -> None:
-        """Run Head A + Head I once and store inflated scores."""
+    def _compute_endpoints(self) -> None:
+        """Cache predictive_sufficiency_ and predictive_necessity_."""
+        self.predictive_sufficiency_ = self.conditional_predictive_values([])
+
+        p = self.n_features_in_
+        keep = self.base_estimator_.ensemble_generator_.unique_filter_.features_to_keep_
+        valid_idx = np.flatnonzero(keep)
+        h_filtered = int(keep.sum())
+
+        # Leave-one-out for every valid filtered feature, batched through
+        # the head. One row per valid feature.
+        mask_rows = np.ones((h_filtered, h_filtered), dtype=bool)
+        np.fill_diagonal(mask_rows, False)
+        cond_mask = torch.as_tensor(mask_rows, dtype=torch.bool, device=self._device)
+        emb_batch = self._column_embeddings.expand(h_filtered, -1, -1)
+
         with torch.no_grad():
-            obs = self._head_a(self._column_embeddings).squeeze(0).cpu().numpy().astype(np.float64)
-            interv = self._head_i(self._column_embeddings).squeeze(0).cpu().numpy().astype(np.float64)
+            scores = self.value_head_(emb_batch, cond_mask)  # (h_filtered, h_filtered)
 
-        self.observational_relevance_ = self._inflate(obs)
-        self.interventional_effects_ = self._inflate(interv)
+        diag = scores.diagonal(dim1=0, dim2=1).cpu().numpy().astype(np.float64)
+        # Note: diag[j] = head output at position j when mask = LOO-of-j
+        # = predicted sqrt(Delta_{j | all-but-j}) = predictive necessity.
+
+        out = np.full(p, np.nan, dtype=np.float64)
+        out[valid_idx] = diag
+        self.predictive_necessity_ = out
 
     def _inflate(self, filtered_scores: np.ndarray) -> np.ndarray:
-        """Expand filtered-feature scores to original feature ordering with NaN padding."""
+        """Expand filtered-feature scores to original ordering with NaN padding."""
         mask = self.base_estimator_.ensemble_generator_.unique_filter_.features_to_keep_
         out = np.full(self.n_features_in_, np.nan, dtype=np.float64)
         out[mask] = filtered_scores
@@ -409,7 +362,6 @@ class TabICLExplainer(BaseEstimator):
     def _filtered_cond_mask(self, S: Sequence[int]) -> np.ndarray:
         """Map an original-space conditioning set ``S`` to the filtered mask."""
         keep = self.base_estimator_.ensemble_generator_.unique_filter_.features_to_keep_
-        # Old-index -> new-index only for kept features
         new_index = np.full(self.n_features_in_, -1, dtype=np.int64)
         new_index[keep] = np.arange(int(keep.sum()))
 
@@ -418,7 +370,8 @@ class TabICLExplainer(BaseEstimator):
             j = int(new_index[int(i)])
             if j >= 0:
                 mask[j] = True
-            # Features dropped by the unique filter silently skip — they contribute 0 to e_S
+            # Features dropped by the unique filter are skipped — they
+            # contribute zero to e_S.
         return mask
 
 
@@ -427,35 +380,8 @@ class TabICLExplainer(BaseEstimator):
 # ---------------------------------------------------------------------------
 
 
-def _validate_heads_dict(heads: Mapping[str, Any]) -> dict[str, nn.Module]:
-    required = {"observational", "interventional", "conditional"}
-    missing = required - set(heads.keys())
-    if missing:
-        raise ValueError(
-            f"`heads` must contain keys {sorted(required)}; missing {sorted(missing)}"
-        )
-
-    expected_types = {
-        "observational": ObservationalHead,
-        "interventional": InterventionalHead,
-        "conditional": ConditionalHead,
-    }
-    out: dict[str, nn.Module] = {}
-    for key, cls in expected_types.items():
-        mod = heads[key]
-        if not isinstance(mod, nn.Module):
-            raise TypeError(
-                f"heads['{key}'] must be an nn.Module (ideally {cls.__name__}); "
-                f"got {type(mod).__name__}"
-            )
-        out[key] = mod
-    return out
-
-
-def _load_heads_from_checkpoint(
-    path: str | Path,
-) -> tuple[ObservationalHead, InterventionalHead, ConditionalHead]:
-    """Reconstruct the three heads from a Phase-4 checkpoint's ``heads`` dict."""
+def _load_value_head_from_checkpoint(path: str | Path) -> ConditionalPredictiveValueHead:
+    """Reconstruct the value head from a training checkpoint."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"heads_checkpoint_path does not exist: {path}")
@@ -464,7 +390,7 @@ def _load_heads_from_checkpoint(
     if "heads" not in checkpoint:
         raise KeyError(
             f"Checkpoint at {path} has no 'heads' entry. Was it produced "
-            f"by Phase-4 training with multi_task_enabled=True? Upstream "
+            f"by training with the predictive-value head enabled? Upstream "
             f"TabICL checkpoints do not contain attribution heads."
         )
 
@@ -475,14 +401,9 @@ def _load_heads_from_checkpoint(
     if embed_dim is None:
         raise ValueError(
             f"Checkpoint at {path} is missing heads.config.embed_dim; "
-            f"cannot reconstruct attribution heads."
+            f"cannot reconstruct the value head."
         )
 
-    head_a = ObservationalHead(embed_dim=embed_dim, hidden_dim=hidden_dim)
-    head_i = InterventionalHead(embed_dim=embed_dim, hidden_dim=hidden_dim)
-    head_c = ConditionalHead(embed_dim=embed_dim, hidden_dim=hidden_dim)
-
-    head_a.load_state_dict(heads_blob["observational"])
-    head_i.load_state_dict(heads_blob["interventional"])
-    head_c.load_state_dict(heads_blob["conditional"])
-    return head_a, head_i, head_c
+    head = ConditionalPredictiveValueHead(embed_dim=embed_dim, hidden_dim=hidden_dim)
+    head.load_state_dict(heads_blob["value"])
+    return head
