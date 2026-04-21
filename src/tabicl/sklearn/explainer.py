@@ -323,7 +323,7 @@ class TabICLExplainer(BaseEstimator):
             f"Unexpected column-embedding shape {tuple(column_embeddings.shape)}; "
             f"expected (1, {h_filtered}, {model.embed_dim})"
         )
-        self._column_embeddings = column_embeddings.detach()
+        self._column_embeddings = column_embeddings.detach().float()
 
     def _compute_endpoints(self) -> None:
         """Cache predictive_sufficiency_ and predictive_necessity_."""
