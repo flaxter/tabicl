@@ -268,7 +268,13 @@ def compute_value_queries(
     if p == 0 or mode == "nan" or not hasattr(scm, "simulate"):
         return _empty_value_labels(p)
 
-    X_base, y_base = scm.simulate(n_samples=n_oracle, rng=rng)
+    # Some SCMs (MLPSCM) have an XSampler with fixed per-column state that
+    # doesn't respect n_samples; fall back to their native seq_len when
+    # overriding would break the mixed-column sampler.
+    try:
+        X_base, y_base = scm.simulate(n_samples=n_oracle, rng=rng)
+    except RuntimeError:
+        X_base, y_base = scm.simulate(rng=rng)
     if isinstance(X_base, torch.Tensor):
         X_base = X_base.cpu().numpy()
     if isinstance(y_base, torch.Tensor):
