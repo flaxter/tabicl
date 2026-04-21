@@ -205,33 +205,39 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    rows: List[Dict[str, Any]] = []
-    for prior in priors:
-        for n in ns:
-            for p in ps:
-                for batch in batches:
-                    for rep in range(args.n_batches):
-                        row = bench_one(
-                            prior=prior, n=n, p=p, batch=batch,
-                            n_mc=args.n_mc, k_cond_triples=args.k_cond_triples,
-                            seed=args.seed + rep * 101,
-                        )
-                        row["rep"] = rep
-                        rows.append(row)
-                        print(
-                            f"{prior:>22s} n={n:>4d} p={p:>3d} batch={batch:>3d} "
-                            f"t_total={row['t_total_with_labels_s']:.3f}s "
-                            f"labels/s={row['labels_per_sec']:.1f} "
-                            f"overhead={row['overhead_ratio']:.2f}x"
-                        )
-
-    if rows:
-        fieldnames = list(rows[0].keys())
-        with open(out_path, "w", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"\nWrote {len(rows)} rows to {out_path}")
+    # Flush per row so partial results survive SLURM wall-clock kills.
+    fieldnames = [
+        "prior", "n", "p", "batch", "n_mc", "k_cond_triples",
+        "t_scm_s", "t_label_A_s", "t_label_I_s", "t_label_C_s",
+        "t_total_with_labels_s", "overhead_ratio", "labels_per_sec", "rep",
+    ]
+    n_rows = 0
+    with open(out_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        fh.flush()
+        for prior in priors:
+            for n in ns:
+                for p in ps:
+                    for batch in batches:
+                        for rep in range(args.n_batches):
+                            row = bench_one(
+                                prior=prior, n=n, p=p, batch=batch,
+                                n_mc=args.n_mc, k_cond_triples=args.k_cond_triples,
+                                seed=args.seed + rep * 101,
+                            )
+                            row["rep"] = rep
+                            writer.writerow(row)
+                            fh.flush()
+                            n_rows += 1
+                            print(
+                                f"{prior:>22s} n={n:>4d} p={p:>3d} batch={batch:>3d} "
+                                f"t_total={row['t_total_with_labels_s']:.3f}s "
+                                f"labels/s={row['labels_per_sec']:.1f} "
+                                f"overhead={row['overhead_ratio']:.2f}x",
+                                flush=True,
+                            )
+    print(f"\nWrote {n_rows} rows to {out_path}")
 
 
 if __name__ == "__main__":
