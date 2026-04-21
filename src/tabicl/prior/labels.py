@@ -38,7 +38,7 @@ For each sampled S, targets are computed for all i in [p]; NaN for i in S.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -72,6 +72,16 @@ class ValueQuery:
     targets: Tensor
     raw_targets: Optional[Tensor] = None
     query_type: str = "random"
+
+
+@dataclass(frozen=True)
+class OracleContext:
+    """One simulator-oracle draw prepared for repeated predictive-value queries."""
+
+    X: np.ndarray
+    y: np.ndarray
+    col_bins: np.ndarray
+    y_var: float
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +220,68 @@ def _binned_V(col_bins: np.ndarray, y: np.ndarray, S: np.ndarray) -> float:
     return float(np.sum(counts * (means - overall) ** 2) / total)
 
 
+def build_oracle_context(
+    scm: Any,
+    p: int,
+    *,
+    n_oracle: int = 512,
+    rng: Optional[np.random.Generator] = None,
+    n_bins: int = 10,
+) -> OracleContext:
+    """Simulate and pre-bin one oracle sample for repeated queries over S."""
+    rng = rng if rng is not None else np.random.default_rng()
+
+    try:
+        X_base, y_base = scm.simulate(n_samples=n_oracle, rng=rng)
+    except RuntimeError:
+        X_base, y_base = scm.simulate(rng=rng)
+
+    if isinstance(X_base, torch.Tensor):
+        X_base = X_base.cpu().numpy()
+    if isinstance(y_base, torch.Tensor):
+        y_base = y_base.cpu().numpy()
+
+    X_base = np.asarray(X_base, dtype=np.float64)
+    y_base = np.asarray(y_base, dtype=np.float64).reshape(-1)
+    if X_base.ndim != 2 or X_base.shape[1] != p:
+        raise ValueError(f"oracle sample must have shape (n, {p}); got {X_base.shape}")
+
+    col_bins = np.stack(
+        [_quantile_bin(X_base[:, j], n_bins=n_bins) for j in range(p)], axis=1
+    )
+    return OracleContext(
+        X=X_base,
+        y=y_base,
+        col_bins=col_bins,
+        y_var=float(np.var(y_base)),
+    )
+
+
+def V_of_subset(context: OracleContext, S: np.ndarray) -> float:
+    """Plug-in estimate of ``V(S)`` from a prepared oracle draw."""
+    return _binned_V(context.col_bins, context.y, np.asarray(S, dtype=int))
+
+
+def delta_vector_for_S(context: OracleContext, S: np.ndarray) -> np.ndarray:
+    """Vector of plug-in ``Delta_{i|S}`` estimates with NaN at ``i in S``."""
+    S = np.asarray(S, dtype=int)
+    p = int(context.X.shape[1])
+    V_S = V_of_subset(context, S)
+    out = np.full(p, np.nan, dtype=np.float64)
+    S_set = set(int(j) for j in S.tolist())
+    for i in range(p):
+        if i in S_set:
+            continue
+        Si = np.concatenate([S, np.array([i], dtype=int)])
+        out[i] = max(0.0, V_of_subset(context, Si) - V_S)
+    return out
+
+
+def delta_value(context: OracleContext, i: int, S: np.ndarray) -> float:
+    """Single plug-in ``Delta_{i|S}`` entry from a prepared oracle draw."""
+    return float(delta_vector_for_S(context, S)[int(i)])
+
+
 # ---------------------------------------------------------------------------
 # Top-level label entry point
 # ---------------------------------------------------------------------------
@@ -268,44 +340,21 @@ def compute_value_queries(
     if p == 0 or mode == "nan" or not hasattr(scm, "simulate"):
         return _empty_value_labels(p)
 
-    # Some SCMs (MLPSCM) have an XSampler with fixed per-column state that
-    # doesn't respect n_samples; fall back to their native seq_len when
-    # overriding would break the mixed-column sampler.
     try:
-        X_base, y_base = scm.simulate(n_samples=n_oracle, rng=rng)
-    except RuntimeError:
-        X_base, y_base = scm.simulate(rng=rng)
-    if isinstance(X_base, torch.Tensor):
-        X_base = X_base.cpu().numpy()
-    if isinstance(y_base, torch.Tensor):
-        y_base = y_base.cpu().numpy()
-    X_base = np.asarray(X_base, dtype=np.float64)
-    y_base = np.asarray(y_base, dtype=np.float64).reshape(-1)
-
-    if X_base.ndim != 2 or X_base.shape[1] != p:
+        context = build_oracle_context(
+            scm,
+            p,
+            n_oracle=n_oracle,
+            rng=rng,
+            n_bins=n_bins,
+        )
+    except ValueError:
         return _empty_value_labels(p)
 
-    y_var = float(np.var(y_base))
-
-    col_bins = np.stack(
-        [_quantile_bin(X_base[:, j], n_bins=n_bins) for j in range(p)], axis=1
-    )
-
     queries: List[ValueQuery] = []
-    all_feats = np.arange(p, dtype=int)
     for S, query_type in sample_value_queries_meta(p, rng, mixture=mixture):
-        V_S = _binned_V(col_bins, y_base, S)
-        targets = np.full(p, np.nan, dtype=np.float64)
-        raw = np.full(p, np.nan, dtype=np.float64)
-        S_set = set(int(j) for j in S.tolist())
-        for i in all_feats:
-            if int(i) in S_set:
-                continue
-            Si = np.concatenate([S, np.array([int(i)])])
-            V_Si = _binned_V(col_bins, y_base, Si)
-            delta = max(0.0, V_Si - V_S)
-            raw[i] = delta
-            targets[i] = float(np.sqrt(delta))
+        raw = delta_vector_for_S(context, S)
+        targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
         S_mask = torch.zeros(p, dtype=torch.bool)
         if S.size > 0:
             S_mask[torch.as_tensor(S, dtype=torch.long)] = True
@@ -320,7 +369,7 @@ def compute_value_queries(
 
     return {
         "value_queries": queries,
-        "y_var_raw": y_var,
+        "y_var_raw": context.y_var,
         "label_scale": "rms_y_units",
     }
 
