@@ -230,6 +230,12 @@ def build_parser():
     parser.add_argument("--lambda_value", type=float, default=1.0, help="Manual lambda on value-oracle loss.")
     parser.add_argument("--huber_delta", type=float, default=1.0, help="Huber loss delta for the value head.")
     parser.add_argument(
+        "--nan_guard",
+        action="store_true",
+        help="Skip optimizer.step() when the clipped gradient norm is non-finite. "
+        "Belt-and-braces guard against rare gradient spikes; default off preserves existing behaviour.",
+    )
+    parser.add_argument(
         "--trunk_freeze_steps",
         type=int,
         default=1000,

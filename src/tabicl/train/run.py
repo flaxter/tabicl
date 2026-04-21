@@ -771,11 +771,18 @@ class Trainer:
             )
 
         # Clip the gradient
+        skip_step = False
         if self.config.gradient_clipping > 0:
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            total_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
             if getattr(self, "loss_fn", None) is not None:
-                nn.utils.clip_grad_norm_(self.loss_fn.parameters(), self.config.gradient_clipping)
+                loss_norm = nn.utils.clip_grad_norm_(self.loss_fn.parameters(), self.config.gradient_clipping)
+            else:
+                loss_norm = None
+            if getattr(self.config, "nan_guard", False):
+                if not torch.isfinite(total_norm) or (loss_norm is not None and not torch.isfinite(loss_norm)):
+                    print(f"[nan_guard] step {self.curr_step}: non-finite grad norm (trunk={total_norm}, loss={loss_norm}); skipping optimizer step", flush=True)
+                    skip_step = True
 
         # Phase 4: trunk-freeze warmup — zero gradients on the pretraining
         # trunk for the first N steps so the heads stabilise before the
@@ -791,7 +798,8 @@ class Trainer:
                     p.grad.zero_()
 
         # Update parameters
-        self.scaler.step(self.optimizer)
+        if not skip_step:
+            self.scaler.step(self.optimizer)
         self.scaler.update()
 
         # Update the learning rate
