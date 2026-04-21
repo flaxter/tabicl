@@ -34,6 +34,8 @@ dependencies = [
     "psutil",  # used for memory calculation at inference
     "tqdm>=4.64.0",
     "huggingface-hub",
+    "joblib",  # scripts/bench_labels.py parallel dispatch (also a sklearn transitive)
+    "threadpoolctl",  # pin BLAS to 1 thread per joblib worker in bench scripts
 ]
 
 [project.optional-dependencies]

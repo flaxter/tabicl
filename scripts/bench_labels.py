@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
+from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
 
 from tabicl.prior.identifiable_scm import ANMSCM, LiNGAMSCM, TreeSCM_Ident
 from tabicl.prior.labels import compute_labels
@@ -112,55 +114,60 @@ def bench_one(
     n_mc: int,
     k_cond_triples: int,
     seed: int,
+    rep: int = 0,
 ) -> Dict[str, Any]:
-    factory = _FACTORIES[prior]
+    # Pin BLAS to a single thread inside this worker so parallel configs don't
+    # fight over the shared thread pool and the per-cell timings stay clean.
+    with threadpool_limits(1):
+        factory = _FACTORIES[prior]
 
-    # 1. SCM + (X, y) sampling baseline (summed across the batch).
-    t0 = time.perf_counter()
-    scms = []
-    Xs, ys = [], []
-    for b in range(batch):
-        scm = factory(n=n, p=p, seed=seed + b)
-        X, y = scm()
-        scms.append(scm)
-        Xs.append(X)
-        ys.append(y)
-    t_scm = time.perf_counter() - t0
+        # 1. SCM + (X, y) sampling baseline (summed across the batch).
+        t0 = time.perf_counter()
+        scms = []
+        Xs, ys = [], []
+        for b in range(batch):
+            scm = factory(n=n, p=p, seed=seed + b)
+            X, y = scm()
+            scms.append(scm)
+            Xs.append(X)
+            ys.append(y)
+        t_scm = time.perf_counter() - t0
 
-    # 2. Total (with labels).
-    t0 = time.perf_counter()
-    rng = np.random.default_rng(seed)
-    for b in range(batch):
-        compute_labels(
-            scms[b], Xs[b], ys[b],
-            n_mc=n_mc, k_cond_triples=k_cond_triples, rng=rng,
-        )
-    t_total_labels_only = time.perf_counter() - t0
+        # 2. Total (with labels).
+        t0 = time.perf_counter()
+        rng = np.random.default_rng(seed)
+        for b in range(batch):
+            compute_labels(
+                scms[b], Xs[b], ys[b],
+                n_mc=n_mc, k_cond_triples=k_cond_triples, rng=rng,
+            )
+        t_total_labels_only = time.perf_counter() - t0
 
-    # 3. Per-head isolated costs (first batch element only, to keep the
-    # benchmark under a few minutes on large grids).
-    t_A = _time_single_head(scms[0], Xs[0], ys[0], "A", n_mc, k_cond_triples)
-    t_I = _time_single_head(scms[0], Xs[0], ys[0], "I", n_mc, k_cond_triples)
-    t_C = _time_single_head(scms[0], Xs[0], ys[0], "C", n_mc, k_cond_triples)
+        # 3. Per-head isolated costs (first batch element only, to keep the
+        # benchmark under a few minutes on large grids).
+        t_A = _time_single_head(scms[0], Xs[0], ys[0], "A", n_mc, k_cond_triples)
+        t_I = _time_single_head(scms[0], Xs[0], ys[0], "I", n_mc, k_cond_triples)
+        t_C = _time_single_head(scms[0], Xs[0], ys[0], "C", n_mc, k_cond_triples)
 
-    t_total_with_labels = t_scm + t_total_labels_only
-    overhead_ratio = t_total_labels_only / max(t_scm, 1e-9)
+        t_total_with_labels = t_scm + t_total_labels_only
+        overhead_ratio = t_total_labels_only / max(t_scm, 1e-9)
 
-    return {
-        "prior": prior,
-        "n": n,
-        "p": p,
-        "batch": batch,
-        "n_mc": n_mc,
-        "k_cond_triples": k_cond_triples,
-        "t_scm_s": round(t_scm, 4),
-        "t_label_A_s": round(t_A, 4),
-        "t_label_I_s": round(t_I, 4),
-        "t_label_C_s": round(t_C, 4),
-        "t_total_with_labels_s": round(t_total_with_labels, 4),
-        "overhead_ratio": round(overhead_ratio, 3),
-        "labels_per_sec": round(batch / max(t_total_with_labels, 1e-9), 2),
-    }
+        return {
+            "prior": prior,
+            "n": n,
+            "p": p,
+            "batch": batch,
+            "n_mc": n_mc,
+            "k_cond_triples": k_cond_triples,
+            "t_scm_s": round(t_scm, 4),
+            "t_label_A_s": round(t_A, 4),
+            "t_label_I_s": round(t_I, 4),
+            "t_label_C_s": round(t_C, 4),
+            "t_total_with_labels_s": round(t_total_with_labels, 4),
+            "overhead_ratio": round(overhead_ratio, 3),
+            "labels_per_sec": round(batch / max(t_total_with_labels, 1e-9), 2),
+            "rep": rep,
+        }
 
 
 def parse_list(s: str, cast=int) -> List[Any]:
@@ -180,7 +187,9 @@ def main() -> None:
     ap.add_argument("--n-mc", type=int, default=2048)
     ap.add_argument("--k-cond-triples", type=int, default=16)
     ap.add_argument("--n-jobs", type=int, default=1,
-                    help="Reserved for future joblib parallelism.")
+                    help="Number of joblib workers over (prior, n, p, batch, rep) "
+                         "configs. BLAS is pinned to 1 thread per worker to keep "
+                         "per-cell timings clean.")
     ap.add_argument("--n-batches", type=int, default=1,
                     help="Number of repetitions per (prior, n, p, batch) cell.")
     ap.add_argument("--seed", type=int, default=0)
@@ -211,32 +220,42 @@ def main() -> None:
         "t_scm_s", "t_label_A_s", "t_label_I_s", "t_label_C_s",
         "t_total_with_labels_s", "overhead_ratio", "labels_per_sec", "rep",
     ]
+    tasks = (
+        delayed(bench_one)(
+            prior=prior, n=n, p=p, batch=batch,
+            n_mc=args.n_mc, k_cond_triples=args.k_cond_triples,
+            seed=args.seed + rep * 101, rep=rep,
+        )
+        for prior in priors
+        for n in ns
+        for p in ps
+        for batch in batches
+        for rep in range(args.n_batches)
+    )
+
+    # return_as='generator' streams rows back as workers finish, so we can
+    # keep the per-row CSV flush added in db2b64d and still dispatch across
+    # --n-jobs workers. Row order will be completion order, not dispatch
+    # order, under n_jobs > 1.
+    results = Parallel(n_jobs=args.n_jobs, return_as="generator")(tasks)
+
     n_rows = 0
     with open(out_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         fh.flush()
-        for prior in priors:
-            for n in ns:
-                for p in ps:
-                    for batch in batches:
-                        for rep in range(args.n_batches):
-                            row = bench_one(
-                                prior=prior, n=n, p=p, batch=batch,
-                                n_mc=args.n_mc, k_cond_triples=args.k_cond_triples,
-                                seed=args.seed + rep * 101,
-                            )
-                            row["rep"] = rep
-                            writer.writerow(row)
-                            fh.flush()
-                            n_rows += 1
-                            print(
-                                f"{prior:>22s} n={n:>4d} p={p:>3d} batch={batch:>3d} "
-                                f"t_total={row['t_total_with_labels_s']:.3f}s "
-                                f"labels/s={row['labels_per_sec']:.1f} "
-                                f"overhead={row['overhead_ratio']:.2f}x",
-                                flush=True,
-                            )
+        for row in results:
+            writer.writerow(row)
+            fh.flush()
+            n_rows += 1
+            print(
+                f"{row['prior']:>22s} n={row['n']:>4d} p={row['p']:>3d} "
+                f"batch={row['batch']:>3d} "
+                f"t_total={row['t_total_with_labels_s']:.3f}s "
+                f"labels/s={row['labels_per_sec']:.1f} "
+                f"overhead={row['overhead_ratio']:.2f}x",
+                flush=True,
+            )
     print(f"\nWrote {n_rows} rows to {out_path}")
 
 
