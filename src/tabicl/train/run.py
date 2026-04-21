@@ -223,11 +223,22 @@ class Trainer:
             if self.master_process:
                 print("Model compiled successfully.")
 
-        # Wrap model into DDP container if using distributed training
-        if self.ddp:
+        # Wrap model into DDP container if using distributed training.
+        # Heads-only training freezes col/row/icl (the only trunk modules),
+        # which leaves TabICL with zero trainable parameters — DDP's init
+        # rejects that. The value head that *is* trainable lives on
+        # ``loss_fn``, not on ``model``, so we can safely skip the wrap; a
+        # single-process ``torchrun`` has nothing to all-reduce anyway.
+        num_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        if self.ddp and num_trainable > 0:
             self.model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False)
             self.raw_model = self.model.module
         else:
+            if self.ddp and num_trainable == 0 and self.master_process:
+                print(
+                    "Model has no trainable parameters (heads-only run); skipping DDP wrap.",
+                    flush=True,
+                )
             self.model = model
             self.raw_model = model
 
