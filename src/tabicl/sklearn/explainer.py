@@ -318,21 +318,24 @@ class TabICLExplainer(BaseEstimator):
         # the rest of the trunk untouched so the original c8549e2 path
         # (match inputs to trunk dtype) works.
         trunk_dtype = next(model.parameters()).dtype
-        # Diagnostic run (tabicl 479b52b) confirmed trunk_dtype=fp32 with
-        # zero mismatched params/buffers, yet the row_interactor LayerNorm
-        # still failed with "expected Half, found Float". The Half came
-        # from AMP autocast inside the submodules' InferenceManagers,
-        # which wrap their forward in a FRESH `torch.autocast("cuda")`
-        # context with enabled=True — that fresh context takes precedence
-        # over any outer `autocast(enabled=False)` we might set.
-        # Fix: disable use_amp on every InferenceManager so the wrapping
-        # autocast context never gets entered.
-        for m in model.modules():
-            if hasattr(m, "inference_mgr"):
-                try:
-                    m.inference_mgr.use_amp = False
-                except AttributeError:
-                    pass
+        # The v2 regressor oracle path has been crashing with "expected
+        # Half but found Float" in row_interactor's LayerNorm. Diagnostic
+        # run (tabicl 479b52b) confirmed trunk_dtype=fp32 with zero
+        # mismatched params/buffers, so the Half tensor comes from AMP
+        # autocast inside submodule InferenceManagers. Setting
+        # `m.inference_mgr.use_amp = False` on each submodule is not
+        # sufficient because InferenceManager.configure() is called at
+        # the start of every submodule forward with `use_amp` pulled
+        # from the cached `inference_config_.COL_CONFIG/ROW_CONFIG/
+        # ICL_CONFIG` (see sklearn/base.py::_build_inference_config).
+        # The actual fix is to mutate that config so every subsequent
+        # configure() call reads use_amp=False.
+        inference_config = getattr(self.base_estimator_, "inference_config_", None)
+        if inference_config is not None:
+            for attr in ("COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG"):
+                cfg = getattr(inference_config, attr, None)
+                if isinstance(cfg, dict):
+                    cfg["use_amp"] = False
         X_t = torch.from_numpy(X_cat).to(self._device, dtype=trunk_dtype)
         y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device, dtype=trunk_dtype)
 
