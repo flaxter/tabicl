@@ -319,10 +319,11 @@ def _generate_case(
             min_features=min_features,
             max_features=max_features,
         )
-        scm = prior_cls(**params)
-        X_raw, y_raw = scm()
+        with torch.no_grad():
+            scm = prior_cls(**params)
+            X_raw, y_raw = scm()
 
-        X_cls, y_cls = Reg2Cls(params)(X_raw, y_raw)
+            X_cls, y_cls = Reg2Cls(params)(X_raw.detach(), y_raw.detach())
         X_batch = X_cls.unsqueeze(0)
         y_batch = y_cls.unsqueeze(0)
         d = torch.tensor([params["num_features"]], dtype=torch.long)
