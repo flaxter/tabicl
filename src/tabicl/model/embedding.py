@@ -454,13 +454,26 @@ class ColEmbedding(nn.Module):
              - E is embedding dimension.
         """
         if self.feature_group:
-            assert d is None, "d is not supported when feature grouping is enabled."
-            return self._train_forward_with_feature_group(X, y_train, embed_with_test)
+            return self._train_forward_with_feature_group(X, y_train, d, embed_with_test)
         else:
             return self._train_forward_without_feature_group(X, y_train, d, embed_with_test)
 
-    def _train_forward_with_feature_group(self, X: Tensor, y_train: Tensor, embed_with_test: bool) -> Tensor:
-        """Training path when feature grouping is enabled."""
+    def _train_forward_with_feature_group(
+        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
+    ) -> Tensor:
+        """Training path when feature grouping is enabled.
+
+        Supports an optional ``d`` that gives the number of real features per
+        table. Feature-grouping mode ``"same"`` preserves the feature axis
+        (``G == H``), so the trunk runs over all ``H`` columns — including
+        any padding columns the caller stacked for uniform shape — and the
+        downstream loss/head is responsible for masking group indices
+        ``g >= d[b]``. Real-feature groups near the ``d[b]`` boundary get a
+        small amount of contamination because the circular-rotation indexing
+        ``(idxs + 2**i) % H`` may pull a padding column into the group's
+        ``group_size`` window; this matches the existing ``d=None`` behaviour
+        in the no-feature-group path and is a known approximation.
+        """
         train_size = y_train.shape[1]
         X = self.feature_grouping(X)  # (B, T, G, group_size)
         if self.reserve_cls_tokens > 0:
