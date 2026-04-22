@@ -463,29 +463,125 @@ class ColEmbedding(nn.Module):
     ) -> Tensor:
         """Training path when feature grouping is enabled.
 
-        Supports an optional ``d`` that gives the number of real features per
-        table. Feature-grouping mode ``"same"`` preserves the feature axis
-        (``G == H``), so the trunk runs over all ``H`` columns — including
-        any padding columns the caller stacked for uniform shape — and the
-        downstream loss/head is responsible for masking group indices
-        ``g >= d[b]``. Real-feature groups near the ``d[b]`` boundary get a
-        small amount of contamination because the circular-rotation indexing
-        ``(idxs + 2**i) % H`` may pull a padding column into the group's
-        ``group_size`` window; this matches the existing ``d=None`` behaviour
-        in the no-feature-group path and is a known approximation.
+        Supports an optional ``d`` giving the real feature count per table.
+        Fast path (``d`` uniform across the batch): truncate ``X`` to
+        ``d[0]`` columns before ``feature_grouping`` so no padding column
+        ever enters a real-feature group. Slow path (``d`` non-uniform):
+        batch samples by distinct ``d`` values and run ``feature_grouping``
+        per-group, then scatter back into a ``(B, T, G+C, E)`` tensor with
+        padding-group positions zero-filled. ``d=None`` preserves the
+        original behaviour (treats all ``H`` columns as real features).
         """
         train_size = y_train.shape[1]
-        X = self.feature_grouping(X)  # (B, T, G, group_size)
-        if self.reserve_cls_tokens > 0:
-            X = F.pad(X, (0, 0, self.reserve_cls_tokens, 0), value=-100.0)
+        B, T, H = X.shape
+        C = self.reserve_cls_tokens
+        mode = "same" if self.feature_group is True else self.feature_group
+        size = self.feature_group_size
+        G_full = H if mode == "same" else (H + size - 1) // size
 
-        features = X.transpose(1, 2)  # (B, G+C, T, group_size)
+        if d is None:
+            X_g = self.feature_grouping(X)  # (B, T, G, group_size)
+            if C > 0:
+                X_g = F.pad(X_g, (0, 0, C, 0), value=-100.0)
+            features = X_g.transpose(1, 2)  # (B, G+C, T, group_size)
+            if self.target_aware:
+                assert y_train is not None, "y_train must be provided when target_aware=True."
+                y_e = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
+            else:
+                y_e = y_train
+            embeddings = self._compute_embeddings(features, train_size, y_e, embed_with_test)
+            return embeddings.transpose(1, 2)  # (B, T, G+C, E)
+
+        if torch.all(d == d[0]):
+            return self._train_forward_fg_uniform_d(
+                X, y_train, int(d[0].item()), train_size, G_full, C, embed_with_test
+            )
+        return self._train_forward_fg_nonuniform_d(
+            X, y_train, d, train_size, G_full, C, embed_with_test
+        )
+
+    def _train_forward_fg_uniform_d(
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d0: int,
+        train_size: int,
+        G_full: int,
+        C: int,
+        embed_with_test: bool,
+    ) -> Tensor:
+        """Feature-group training with uniform ``d`` across the batch."""
+        B, T, H = X.shape
+        X_trunc = X[:, :, :d0] if d0 < H else X
+        X_g = self.feature_grouping(X_trunc)  # (B, T, G_sub, group_size)
+        if C > 0:
+            X_g = F.pad(X_g, (0, 0, C, 0), value=-100.0)
+        features = X_g.transpose(1, 2)  # (B, G_sub+C, T, group_size)
         if self.target_aware:
             assert y_train is not None, "y_train must be provided when target_aware=True."
-            y_train = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
+            y_e = y_train.unsqueeze(1).expand(-1, features.shape[1], -1)
+        else:
+            y_e = y_train
+        eff = self._compute_embeddings(features, train_size, y_e, embed_with_test)
+        eff = eff.transpose(1, 2)  # (B, T, G_sub+C, E)
 
-        embeddings = self._compute_embeddings(features, train_size, y_train, embed_with_test)
-        return embeddings.transpose(1, 2)  # (B, T, G+C, E)
+        if eff.shape[2] < G_full + C:
+            pad_cols = G_full + C - eff.shape[2]
+            eff = F.pad(eff, (0, 0, 0, pad_cols), value=0.0)
+        return eff
+
+    def _train_forward_fg_nonuniform_d(
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d: Tensor,
+        train_size: int,
+        G_full: int,
+        C: int,
+        embed_with_test: bool,
+    ) -> Tensor:
+        """Feature-group training with ``d`` that varies across the batch.
+
+        Groups samples by distinct ``d`` value, runs the embedding path
+        per-group, and scatters back into a full ``(B, T, G_full+C, E)``
+        tensor. Padding-group positions are zero-filled; downstream code
+        that masks ``g >= d[b]`` will ignore them.
+        """
+        B, T, H = X.shape
+        output = torch.zeros(
+            B, T, G_full + C, self.embed_dim, device=X.device, dtype=X.dtype
+        )
+        mode = "same" if self.feature_group is True else self.feature_group
+        size = self.feature_group_size
+
+        for d_val in torch.unique(d).tolist():
+            d_int = int(d_val)
+            idx = torch.nonzero(d == d_val, as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            X_sub = X[idx, :, :d_int]
+            y_sub = y_train[idx] if y_train is not None else None
+            G_sub = d_int if mode == "same" else (d_int + size - 1) // size
+
+            X_g = self.feature_grouping(X_sub)
+            if C > 0:
+                X_g = F.pad(X_g, (0, 0, C, 0), value=-100.0)
+            features = X_g.transpose(1, 2)
+            if self.target_aware:
+                assert y_sub is not None, "y_train must be provided when target_aware=True."
+                y_e = y_sub.unsqueeze(1).expand(-1, features.shape[1], -1)
+            else:
+                y_e = y_sub
+
+            eff = self._compute_embeddings(features, train_size, y_e, embed_with_test)
+            eff = eff.transpose(1, 2)  # (B_sub, T, G_sub+C, E)
+
+            if C > 0:
+                output[idx, :, :C, :] = eff[:, :, :C, :]
+            if G_sub > 0:
+                output[idx, :, C:C + G_sub, :] = eff[:, :, C:C + G_sub, :]
+
+        return output
 
     def _train_forward_without_feature_group(
         self, X: Tensor, y_train: Tensor, d: Optional[Tensor], embed_with_test: bool
@@ -711,8 +807,9 @@ class ColEmbedding(nn.Module):
             Used only for target-aware embedding.
 
         d : Optional[Tensor], default=None
-            The number of features per dataset of shape (B,). Used only in training mode and
-            when feature grouping is disabled. If feature grouping is enabled, it must be None.
+            The number of features per dataset of shape (B,). Used only in training mode.
+            When feature grouping is enabled, the fast path truncates X to d[0] columns
+            before grouping (uniform d); non-uniform d is handled per-d-value.
 
         embed_with_test : bool, default=False
             If True, inducing points attend to all samples (train + test) in the set transformer.
