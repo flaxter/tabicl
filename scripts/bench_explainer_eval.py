@@ -133,8 +133,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     t0 = time.time()
     suite = _build_suite(args)
     t_suite = time.time() - t0
+    n_cases = len(suite.cases)
     print(
-        f"[bench_explainer_eval] built {args.suite} suite of {len(suite)} datasets "
+        f"[bench_explainer_eval] built {args.suite} suite of {n_cases} datasets "
         f"in {t_suite:.1f}s",
         flush=True,
     )
