@@ -300,17 +300,20 @@ class TabICLExplainer(BaseEstimator):
         X_dummy_test = np.zeros((1, h_filtered), dtype=np.float32)
         X_cat = np.concatenate([X_train_filtered, X_dummy_test], axis=0)[None, ...]
 
-        trunk_dtype = next(model.parameters()).dtype
-        # Some upstream checkpoints (e.g. v2 regressor loaded with
-        # col_target_aware=True but without matching y_encoder keys in the
-        # state_dict) leave freshly-initialised submodules at fp32 while the
-        # rest of the trunk is fp16. That mismatch breaks downstream
-        # LayerNorm calls in the row_interactor with "expected scalar type
-        # Half but found Float". Force every submodule to the dominant
-        # trunk dtype so the internal pipeline is uniform.
-        model.to(dtype=trunk_dtype)
-        X_t = torch.from_numpy(X_cat).to(self._device, dtype=trunk_dtype)
-        y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device, dtype=trunk_dtype)
+        # Force the whole trunk to fp32 for the attribution forward. The
+        # v2 regressor download arrives in fp16 but some submodules
+        # (notably the y_encoder built on-demand by target_aware=True)
+        # stay at fp32 random-init; the mismatch surfaces as
+        # "RuntimeError: expected scalar type Half but found Float" inside
+        # the row_interactor's LayerNorm even if we try to cast everything
+        # to the dominant dtype via `model.to(dtype=...)` — empirically
+        # that `.to()` call does not reliably cascade to every submodule
+        # (probably due to how submodules are registered on-demand).
+        # Going to fp32 unambiguously matches the heads' fp32 contract and
+        # is what the cached column embeddings end up as anyway.
+        model.float()
+        X_t = torch.from_numpy(X_cat).float().to(self._device)
+        y_t = torch.from_numpy(y_train_np[None, ...]).float().to(self._device)
 
         inference_config = getattr(self.base_estimator_, "inference_config_", None)
 
