@@ -317,32 +317,22 @@ class TabICLExplainer(BaseEstimator):
         # y_encoder submodule to the trunk's dominant dtype, leaving
         # the rest of the trunk untouched so the original c8549e2 path
         # (match inputs to trunk dtype) works.
-        import sys
         trunk_dtype = next(model.parameters()).dtype
-        # Diagnostic: dump any param/buffer whose dtype differs from the
-        # dominant trunk_dtype. The v2 regressor oracle path has been
-        # crashing with "expected Half but found Float" in row_interactor's
-        # LayerNorm through five iteration attempts; we need to see which
-        # specific tensor is out of step.
-        mismatched_params = [
-            (n, str(p.dtype)) for n, p in model.named_parameters()
-            if p.dtype != trunk_dtype
-        ]
-        mismatched_buffers = [
-            (n, str(b.dtype)) for n, b in model.named_buffers()
-            if b.is_floating_point() and b.dtype != trunk_dtype
-        ]
-        print(f"[explainer debug] trunk_dtype={trunk_dtype}  "
-              f"mismatched_params={len(mismatched_params)}  "
-              f"mismatched_buffers={len(mismatched_buffers)}", file=sys.stderr, flush=True)
-        for n, d in mismatched_params[:30]:
-            print(f"  param {n}: {d}", file=sys.stderr, flush=True)
-        for n, d in mismatched_buffers[:30]:
-            print(f"  buffer {n}: {d}", file=sys.stderr, flush=True)
-
-        col_embedder = getattr(model, "col_embedder", None)
-        if col_embedder is not None and hasattr(col_embedder, "y_encoder"):
-            col_embedder.y_encoder.to(dtype=trunk_dtype)
+        # Diagnostic run (tabicl 479b52b) confirmed trunk_dtype=fp32 with
+        # zero mismatched params/buffers, yet the row_interactor LayerNorm
+        # still failed with "expected Half, found Float". The Half came
+        # from AMP autocast inside the submodules' InferenceManagers,
+        # which wrap their forward in a FRESH `torch.autocast("cuda")`
+        # context with enabled=True — that fresh context takes precedence
+        # over any outer `autocast(enabled=False)` we might set.
+        # Fix: disable use_amp on every InferenceManager so the wrapping
+        # autocast context never gets entered.
+        for m in model.modules():
+            if hasattr(m, "inference_mgr"):
+                try:
+                    m.inference_mgr.use_amp = False
+                except AttributeError:
+                    pass
         X_t = torch.from_numpy(X_cat).to(self._device, dtype=trunk_dtype)
         y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device, dtype=trunk_dtype)
 
