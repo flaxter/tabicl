@@ -34,24 +34,22 @@ def _build_suite(args: argparse.Namespace):
         build_in_distribution_suite,
     )
 
+    # The builders take min/max_features (range) and n_rows; the CLI takes
+    # a single num_features and seq_len. Pin both to num_features so each
+    # dataset in the suite has exactly p=num_features columns.
+    builder_kwargs = dict(
+        n_datasets=args.n_datasets,
+        seed=args.seed,
+        n_rows=args.seq_len,
+        min_features=args.num_features,
+        max_features=args.num_features,
+        n_oracle=args.n_oracle,
+        mixture=args.mixture,
+    )
     if args.suite == "in_distribution":
-        return build_in_distribution_suite(
-            n_datasets=args.n_datasets,
-            num_features=args.num_features,
-            seq_len=args.seq_len,
-            seed=args.seed,
-            n_oracle=args.n_oracle,
-            n_bins=args.n_bins,
-        )
+        return build_in_distribution_suite(**builder_kwargs)
     if args.suite == "held_out_prior":
-        return build_held_out_prior_suite(
-            n_datasets=args.n_datasets,
-            num_features=args.num_features,
-            seq_len=args.seq_len,
-            seed=args.seed,
-            n_oracle=args.n_oracle,
-            n_bins=args.n_bins,
-        )
+        return build_held_out_prior_suite(**builder_kwargs)
     raise ValueError(f"Unknown suite {args.suite!r}")
 
 
@@ -102,7 +100,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--num-features", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=500)
     parser.add_argument("--n-oracle", type=int, default=2000)
-    parser.add_argument("--n-bins", type=int, default=10)
+    parser.add_argument("--n-bins", type=int, default=10,
+                        help="Unused by the suite builders; kept for CLI "
+                        "back-compat with earlier bench scripts.")
+    parser.add_argument(
+        "--mixture", default="backup",
+        help="Prior mixture for synthetic cases (default matches preregistration §11).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--device", default="cpu",

@@ -180,6 +180,13 @@ def build_parser():
     parser.add_argument("--col_num_blocks", type=int, default=3, help="Number of blocks in column embedder")
     parser.add_argument("--col_nhead", type=int, default=4, help="Number of attention heads in column embedder")
     parser.add_argument("--col_num_inds", type=int, default=128, help="Number of inducing points in column embedder")
+    parser.add_argument(
+        "--col_target_aware", default=True, type=str2bool,
+        help="If True, the column embedder builds a y_encoder and attends over (x, y). "
+        "Upstream v1.1 was trained with target_aware=False, so heads-only fine-tunes of "
+        "v1.1 must set this to False or the y_encoder is random-init under freeze_col and "
+        "corrupts every column embedding.",
+    )
     parser.add_argument("--freeze_col", default=False, type=str2bool, help="Whether to freeze the column embedder")
     parser.add_argument(
         "--col_feature_group",

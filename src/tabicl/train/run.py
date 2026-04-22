@@ -189,6 +189,7 @@ class Trainer:
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
+            "col_target_aware": getattr(self.config, "col_target_aware", True),
             "col_ssmax": _ssmax(getattr(self.config, "col_ssmax", "qassmax-mlp-elementwise")),
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
