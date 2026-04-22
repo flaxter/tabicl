@@ -201,6 +201,7 @@ class Trainer:
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "bias_free_ln": getattr(self.config, "bias_free_ln", False),
         }
 
         model = TabICL(**self.model_config)

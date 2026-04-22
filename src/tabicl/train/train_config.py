@@ -216,6 +216,16 @@ def build_parser():
         type=str,
         help="ICL-attention SSMax scaling mode: same values as --col_ssmax.",
     )
+    parser.add_argument(
+        "--bias_free_ln",
+        default=False,
+        type=str2bool,
+        help="If True, all LayerNorm layers in the trunk are constructed "
+        "without bias parameters. Upstream v2 regressor was trained with "
+        "bias_free_ln=True and has no norm.bias tensors in its state_dict; "
+        "loading it into a model built with default False produces 48 random "
+        "norm.bias params that contaminate the frozen trunk.",
+    )
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
