@@ -1,4 +1,25 @@
-"""Checkpoint scorer for the conditional predictive value head."""
+"""§11.1 + §11.2 evaluation of the conditional predictive value head.
+
+Consumes a heads-only checkpoint (produced by training with the value head
+enabled) and writes two CSVs read directly by the paper:
+
+- ``--out_s11_1`` (§11.1): per-dataset / per-|S|-stratum Spearman, Pearson,
+  MAE on RMS scale, top-1 recall, top-3 recall. Strata are
+  ``empty`` (|S|=0), ``singleton`` (|S|=1), ``small`` (|S| in {2,3,4}),
+  ``medium`` (|S| ~ p/2), ``near_full`` (|S| in {p-2, p-1}) — locked by the
+  preregistration.
+- ``--out_s11_2`` (§11.2): per-dataset Spearman/Pearson/MAE for the two
+  endpoints ``predictive_sufficiency_`` (s_i = r_{i|emptyset}) and
+  ``predictive_necessity_`` (n_i = r_{i|[p]\\{i}}). Trailing rows report the
+  pooled calibration slope and intercept across every (target, pred) pair.
+
+The synthetic datasets are drawn through
+:func:`tabicl.eval.explainer_eval.build_in_distribution_suite` at
+``mix_scm`` — the same prior mixture the head was trained on. Features are
+sampled in ``[min_features, max_features]``; the default range
+(13-20) is chosen to force the mixture-sampling path in the suite
+builder (p<=12 triggers full 2^p enumeration, which blows up).
+"""
 from __future__ import annotations
 
 import argparse
@@ -6,300 +27,402 @@ import csv
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
-import torch
 
-from tabicl.eval.explainer_eval import EvalSuite, build_held_out_prior_suite, build_in_distribution_suite
-from tabicl.eval.metrics import pearson_per_dataset, spearman_per_dataset, topk_recall_per_dataset
-from tabicl.model.heads import ConditionalPredictiveValueHead
-from tabicl.model.tabicl import TabICL
+from tabicl import TabICLClassifier
+from tabicl.eval.explainer_eval import EvalCase, build_in_distribution_suite
+from tabicl.eval.metrics import (
+    pearson_per_dataset,
+    spearman_per_dataset,
+    topk_recall_per_dataset,
+)
+from tabicl.sklearn.explainer import TabICLExplainer
 
 
-@dataclass(frozen=True)
-class LoadedValueModel:
-    trunk: TabICL
-    value_head: ConditionalPredictiveValueHead
-    device: torch.device
+STRATUM_ORDER = ("empty", "singleton", "small", "medium", "near_full")
+
+
+def stratum_of_state(state: frozenset, p: int) -> str | None:
+    """Classify ``S`` into one of the preregistration strata or None."""
+    s = len(state)
+    if s == 0:
+        return "empty"
+    if s == 1:
+        return "singleton"
+    if 2 <= s <= 4:
+        return "small"
+    if s == max(p // 2, 0):
+        return "medium"
+    if p >= 2 and s in (p - 2, p - 1):
+        return "near_full"
+    return None
 
 
 @dataclass
-class HeadEvalRow:
-    suite: str
+class S11_1Row:
     dataset_id: str
-    stratum: str
     p: int
-    spearman_value: float
-    pearson_value: float
-    mse_value: float
-    mae_value: float
-    top1_next_feature: float
-    top3_next_feature: float
-    spearman_sufficiency: float
-    spearman_necessity: float
-    acquisition_auc: float
+    stratum: str
+    n_states: int
+    spearman: float
+    pearson: float
+    mae: float
+    top1: float
+    top3: float
 
 
-def load_value_model(checkpoint_path: str | Path, device: str | torch.device = "cpu") -> LoadedValueModel:
-    path = Path(checkpoint_path)
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    trunk = TabICL(**checkpoint["config"])
-    trunk.load_state_dict(checkpoint["state_dict"])
-    trunk.to(device).eval()
-
-    heads = checkpoint.get("heads")
-    if heads is None or "value" not in heads:
-        raise KeyError(f"Checkpoint at {path} does not contain a value head.")
-
-    cfg = heads.get("config", {})
-    embed_dim = cfg.get("embed_dim") or checkpoint["config"].get("embed_dim")
-    hidden_dim = cfg.get("hidden_dim")
-    value_head = ConditionalPredictiveValueHead(embed_dim=embed_dim, hidden_dim=hidden_dim)
-    value_head.load_state_dict(heads["value"])
-    value_head.to(device).eval()
-    return LoadedValueModel(trunk=trunk, value_head=value_head, device=torch.device(device))
+@dataclass
+class S11_2Row:
+    dataset_id: str
+    p: int
+    spearman_s: float
+    pearson_s: float
+    mae_s: float
+    spearman_n: float
+    pearson_n: float
+    mae_n: float
 
 
-def evaluate_value_model(model: LoadedValueModel, suite: EvalSuite) -> list[HeadEvalRow]:
-    rows: list[HeadEvalRow] = []
-    for case in suite.cases:
-        col_emb = _column_embeddings(model, case)
-        necessity = _necessity_vector(case.ground_truth.value_by_state, case.X_train.shape[1])
-        suff = case.ground_truth.value_by_state[frozenset()]
+def _nanmean(xs) -> float:
+    arr = np.asarray(list(xs), dtype=np.float64)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return float("nan")
+    return float(np.nanmean(arr))
 
-        for stratum in ("all", "empty", "singleton", "small", "medium", "near_full"):
-            states = _states_for_stratum(case.ground_truth.value_by_state, stratum, case.X_train.shape[1])
-            if not states:
-                continue
-            row = _score_states(
-                suite.name,
-                case.dataset_id,
-                stratum,
-                col_emb,
-                model,
-                states,
-                suff_target=suff,
-                necessity_target=necessity,
-                all_states=case.ground_truth.value_by_state,
+
+def _pooled_slope_intercept(pairs: Sequence[tuple[float, float]]) -> tuple[float, float]:
+    """OLS slope + intercept of pred = slope * target + intercept."""
+    if len(pairs) < 2:
+        return float("nan"), float("nan")
+    arr = np.asarray(pairs, dtype=np.float64)
+    t = arr[:, 0]
+    y = arr[:, 1]
+    mask = np.isfinite(t) & np.isfinite(y)
+    if mask.sum() < 2 or np.std(t[mask]) == 0.0:
+        return float("nan"), float("nan")
+    slope, intercept = np.polyfit(t[mask], y[mask], 1)
+    return float(slope), float(intercept)
+
+
+def evaluate_dataset(
+    case: EvalCase,
+    explainer: TabICLExplainer,
+) -> tuple[list[S11_1Row], S11_2Row, list[tuple[float, float]], list[tuple[float, float]]]:
+    """Evaluate one dataset; return §11.1 rows, §11.2 row, pooled calib pairs."""
+    p = int(case.X_train.shape[1])
+    explainer.fit(case.X_train, case.y_train)
+
+    per_stratum: dict[str, dict[str, list[float]]] = {
+        k: {"spearman": [], "pearson": [], "mae": [], "top1": [], "top3": []}
+        for k in STRATUM_ORDER
+    }
+    per_stratum_counts = {k: 0 for k in STRATUM_ORDER}
+
+    # Cache already-computed states so we don't double-query.
+    seen: dict[frozenset, np.ndarray] = {}
+
+    for state, target in case.ground_truth.value_by_state.items():
+        stratum = stratum_of_state(state, p)
+        if stratum is None:
+            continue
+        if state in seen:
+            pred = seen[state]
+        else:
+            pred = np.asarray(
+                explainer.conditional_predictive_values(sorted(state)),
+                dtype=np.float64,
             )
-            rows.append(row)
-    return rows
+            seen[state] = pred
+        target = np.asarray(target, dtype=np.float64)
 
-
-def write_rows_csv(path: str | Path, rows: Sequence[HeadEvalRow]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        raise ValueError("No rows to write.")
-
-    fieldnames = list(HeadEvalRow.__dataclass_fields__.keys())
-    data = [asdict(row) for row in rows]
-    mean_row = {"suite": data[0]["suite"], "dataset_id": "mean", "stratum": "all", "p": ""}
-    for col in fieldnames[4:]:
-        vals = [row[col] for row in data if np.isfinite(row[col])]
-        mean_row[col] = float(np.mean(vals)) if vals else float("nan")
-
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in data:
-            writer.writerow(row)
-        writer.writerow(mean_row)
-
-
-def _column_embeddings(model: LoadedValueModel, case: Any) -> torch.Tensor:
-    X_full = np.concatenate([case.X_train, case.X_test], axis=0)[None, ...]
-    X_t = torch.as_tensor(X_full, dtype=torch.float, device=model.device)
-    y_train = torch.as_tensor(case.y_train[None, ...], dtype=torch.long, device=model.device)
-    d = torch.tensor([case.X_train.shape[1]], dtype=torch.long, device=model.device)
-    with torch.no_grad():
-        _, col_emb = model.trunk(
-            X_t,
-            y_train=y_train,
-            d=d,
-            return_column_embeddings=True,
-        )
-    return col_emb
-
-
-def _predict_state(col_emb: torch.Tensor, model: LoadedValueModel, state: frozenset[int]) -> np.ndarray:
-    p = col_emb.shape[1]
-    mask = torch.zeros((1, p), dtype=torch.bool, device=model.device)
-    if state:
-        idx = torch.as_tensor(sorted(state), dtype=torch.long, device=model.device)
-        mask[0, idx] = True
-    with torch.no_grad():
-        pred = model.value_head(col_emb, mask).squeeze(0).cpu().numpy().astype(np.float64)
-    if state:
-        pred[np.asarray(sorted(state), dtype=int)] = np.nan
-    return pred
-
-
-def _score_states(
-    suite: str,
-    dataset_id: str,
-    stratum: str,
-    col_emb: torch.Tensor,
-    model: LoadedValueModel,
-    states: Sequence[frozenset[int]],
-    *,
-    suff_target: np.ndarray,
-    necessity_target: np.ndarray,
-    all_states: Mapping[frozenset[int], np.ndarray],
-) -> HeadEvalRow:
-    spearman_rows: list[float] = []
-    pearson_rows: list[float] = []
-    top1_rows: list[float] = []
-    top3_rows: list[float] = []
-    sq_errors: list[float] = []
-    abs_errors: list[float] = []
-
-    for state in states:
-        pred = _predict_state(col_emb, model, state)
-        target = np.asarray(all_states[state], dtype=np.float64)
-        spearman_rows.append(spearman_per_dataset(pred, target))
-        pearson_rows.append(pearson_per_dataset(pred, target))
-        top1_rows.append(topk_recall_per_dataset(pred, target, 1))
-        top3_rows.append(topk_recall_per_dataset(pred, target, min(3, len(target))))
+        per_stratum[stratum]["spearman"].append(spearman_per_dataset(pred, target))
+        per_stratum[stratum]["pearson"].append(pearson_per_dataset(pred, target))
+        per_stratum[stratum]["top1"].append(topk_recall_per_dataset(pred, target, 1))
+        if p >= 3:
+            per_stratum[stratum]["top3"].append(
+                topk_recall_per_dataset(pred, target, min(3, p))
+            )
         mask = np.isfinite(pred) & np.isfinite(target)
         if mask.any():
-            diff = pred[mask] - target[mask]
-            sq_errors.extend((diff ** 2).tolist())
-            abs_errors.extend(np.abs(diff).tolist())
+            per_stratum[stratum]["mae"].append(
+                float(np.mean(np.abs(pred[mask] - target[mask])))
+            )
+        per_stratum_counts[stratum] += 1
 
-    if stratum == "all":
-        suff_pred = _predict_state(col_emb, model, frozenset())
-        necessity_pred = np.array(
-            [
-                _predict_state(col_emb, model, frozenset(j for j in range(col_emb.shape[1]) if j != i))[i]
-                for i in range(col_emb.shape[1])
-            ],
-            dtype=np.float64,
+    rows_11_1: list[S11_1Row] = []
+    for stratum in STRATUM_ORDER:
+        acc = per_stratum[stratum]
+        rows_11_1.append(
+            S11_1Row(
+                dataset_id=case.dataset_id,
+                p=p,
+                stratum=stratum,
+                n_states=per_stratum_counts[stratum],
+                spearman=_nanmean(acc["spearman"]),
+                pearson=_nanmean(acc["pearson"]),
+                mae=_nanmean(acc["mae"]),
+                top1=_nanmean(acc["top1"]),
+                top3=_nanmean(acc["top3"]),
+            )
         )
-        acquisition_auc = _oracle_acquisition_auc(col_emb, model, all_states)
-        suff_spearman = spearman_per_dataset(suff_pred, suff_target)
-        necessity_spearman = spearman_per_dataset(necessity_pred, necessity_target)
-    else:
-        suff_spearman = float("nan")
-        necessity_spearman = float("nan")
-        acquisition_auc = float("nan")
 
-    return HeadEvalRow(
-        suite=suite,
-        dataset_id=dataset_id,
-        stratum=stratum,
-        p=int(col_emb.shape[1]),
-        spearman_value=_nanmean(spearman_rows),
-        pearson_value=_nanmean(pearson_rows),
-        mse_value=float(np.mean(sq_errors)) if sq_errors else float("nan"),
-        mae_value=float(np.mean(abs_errors)) if abs_errors else float("nan"),
-        top1_next_feature=_nanmean(top1_rows),
-        top3_next_feature=_nanmean(top3_rows),
-        spearman_sufficiency=suff_spearman,
-        spearman_necessity=necessity_spearman,
-        acquisition_auc=acquisition_auc,
+    # §11.2 endpoints. The explainer caches sufficiency/necessity at fit().
+    suff_pred = np.asarray(explainer.predictive_sufficiency_, dtype=np.float64)
+    suff_target_raw = case.ground_truth.value_by_state.get(frozenset())
+    if suff_target_raw is None:
+        suff_target = np.full(p, np.nan, dtype=np.float64)
+    else:
+        suff_target = np.asarray(suff_target_raw, dtype=np.float64)
+
+    necessity_pred = np.asarray(explainer.predictive_necessity_, dtype=np.float64)
+    necessity_target = np.full(p, np.nan, dtype=np.float64)
+    for i in range(p):
+        loo_state = frozenset(j for j in range(p) if j != i)
+        t = case.ground_truth.value_by_state.get(loo_state)
+        if t is not None and len(t) > i and np.isfinite(t[i]):
+            necessity_target[i] = float(t[i])
+
+    finite_s = np.isfinite(suff_pred) & np.isfinite(suff_target)
+    finite_n = np.isfinite(necessity_pred) & np.isfinite(necessity_target)
+
+    row_11_2 = S11_2Row(
+        dataset_id=case.dataset_id,
+        p=p,
+        spearman_s=spearman_per_dataset(suff_pred, suff_target),
+        pearson_s=pearson_per_dataset(suff_pred, suff_target),
+        mae_s=float(np.mean(np.abs(suff_pred[finite_s] - suff_target[finite_s])))
+        if finite_s.any()
+        else float("nan"),
+        spearman_n=spearman_per_dataset(necessity_pred, necessity_target),
+        pearson_n=pearson_per_dataset(necessity_pred, necessity_target),
+        mae_n=float(np.mean(np.abs(necessity_pred[finite_n] - necessity_target[finite_n])))
+        if finite_n.any()
+        else float("nan"),
     )
 
+    s_pairs = list(zip(suff_target[finite_s].tolist(), suff_pred[finite_s].tolist()))
+    n_pairs = list(
+        zip(necessity_target[finite_n].tolist(), necessity_pred[finite_n].tolist())
+    )
 
-def _states_for_stratum(value_by_state: Mapping[frozenset[int], np.ndarray], stratum: str, p: int) -> list[frozenset[int]]:
-    states = list(value_by_state.keys())
-    if stratum == "all":
-        return states
-    if stratum == "empty":
-        return [s for s in states if len(s) == 0]
-    if stratum == "singleton":
-        return [s for s in states if len(s) == 1]
-    if stratum == "small":
-        return [s for s in states if 2 <= len(s) <= 4]
-    if stratum == "medium":
-        return [s for s in states if len(s) == p // 2]
-    if stratum == "near_full":
-        return [s for s in states if len(s) in {max(p - 2, 0), max(p - 1, 0)}]
-    raise ValueError(f"Unknown stratum {stratum!r}")
+    return rows_11_1, row_11_2, s_pairs, n_pairs
 
 
-def _necessity_vector(value_by_state: Mapping[frozenset[int], np.ndarray], p: int) -> np.ndarray:
-    out = np.full(p, np.nan, dtype=np.float64)
-    for i in range(p):
-        state = frozenset(j for j in range(p) if j != i)
-        target = value_by_state.get(state)
-        if target is not None:
-            out[i] = float(target[i])
-    return out
+def write_s11_1(path: str | Path, rows: Sequence[S11_1Row]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(S11_1Row.__dataclass_fields__.keys())
+
+    by_stratum: dict[str, list[S11_1Row]] = {k: [] for k in STRATUM_ORDER}
+    for r in rows:
+        by_stratum[r.stratum].append(r)
+
+    stratum_means: list[dict] = []
+    for stratum in STRATUM_ORDER:
+        rs = by_stratum[stratum]
+        stratum_means.append(
+            {
+                "dataset_id": "mean",
+                "p": "",
+                "stratum": stratum,
+                "n_states": int(sum(r.n_states for r in rs)),
+                "spearman": _nanmean([r.spearman for r in rs]),
+                "pearson": _nanmean([r.pearson for r in rs]),
+                "mae": _nanmean([r.mae for r in rs]),
+                "top1": _nanmean([r.top1 for r in rs]),
+                "top3": _nanmean([r.top3 for r in rs]),
+            }
+        )
+
+    across = {
+        "dataset_id": "mean",
+        "p": "",
+        "stratum": "across_strata",
+        "n_states": "",
+        "spearman": _nanmean([m["spearman"] for m in stratum_means]),
+        "pearson": _nanmean([m["pearson"] for m in stratum_means]),
+        "mae": _nanmean([m["mae"] for m in stratum_means]),
+        "top1": _nanmean([m["top1"] for m in stratum_means]),
+        "top3": _nanmean([m["top3"] for m in stratum_means]),
+    }
+
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(asdict(r))
+        for m in stratum_means:
+            w.writerow(m)
+        w.writerow(across)
 
 
-def _oracle_acquisition_auc(
-    col_emb: torch.Tensor,
-    model: LoadedValueModel,
-    value_by_state: Mapping[frozenset[int], np.ndarray],
-) -> float:
-    p = int(col_emb.shape[1])
-    selected: list[int] = []
-    used: set[int] = set()
-    curve = [0.0]
-    cumulative = 0.0
-    for _ in range(p):
-        state = frozenset(selected)
-        pred = _predict_state(col_emb, model, state)
-        candidates = [i for i in range(p) if i not in used]
-        i_best = max(candidates, key=lambda i: pred[i])
-        true_gain = float(value_by_state[state][i_best] ** 2)
-        cumulative += true_gain
-        curve.append(cumulative)
-        selected.append(i_best)
-        used.add(i_best)
+def write_s11_2(
+    path: str | Path,
+    rows: Sequence[S11_2Row],
+    s_pairs: Sequence[tuple[float, float]],
+    n_pairs: Sequence[tuple[float, float]],
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(S11_2Row.__dataclass_fields__.keys()) + [
+        "calib_slope",
+        "calib_intercept",
+    ]
 
-    total = curve[-1]
-    if total <= 0.0:
-        return float("nan")
-    auc = float(np.trapezoid(np.asarray(curve, dtype=np.float64), dx=1.0))
-    return float(np.clip(auc / (total * p), 0.0, 1.0))
+    s_slope, s_intercept = _pooled_slope_intercept(s_pairs)
+    n_slope, n_intercept = _pooled_slope_intercept(n_pairs)
 
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            d = asdict(r)
+            d["calib_slope"] = ""
+            d["calib_intercept"] = ""
+            w.writerow(d)
 
-def _nanmean(values: Iterable[float]) -> float:
-    arr = np.asarray(list(values), dtype=np.float64)
-    return float(np.nanmean(arr)) if np.isfinite(arr).any() else float("nan")
+        w.writerow(
+            {
+                "dataset_id": "mean",
+                "p": "",
+                "spearman_s": _nanmean([r.spearman_s for r in rows]),
+                "pearson_s": _nanmean([r.pearson_s for r in rows]),
+                "mae_s": _nanmean([r.mae_s for r in rows]),
+                "spearman_n": _nanmean([r.spearman_n for r in rows]),
+                "pearson_n": _nanmean([r.pearson_n for r in rows]),
+                "mae_n": _nanmean([r.mae_n for r in rows]),
+                "calib_slope": "",
+                "calib_intercept": "",
+            }
+        )
+        w.writerow(
+            {
+                "dataset_id": "calib_s_pooled",
+                "p": "",
+                "spearman_s": "",
+                "pearson_s": "",
+                "mae_s": "",
+                "spearman_n": "",
+                "pearson_n": "",
+                "mae_n": "",
+                "calib_slope": s_slope,
+                "calib_intercept": s_intercept,
+            }
+        )
+        w.writerow(
+            {
+                "dataset_id": "calib_n_pooled",
+                "p": "",
+                "spearman_s": "",
+                "pearson_s": "",
+                "mae_s": "",
+                "spearman_n": "",
+                "pearson_n": "",
+                "mae_n": "",
+                "calib_slope": n_slope,
+                "calib_intercept": n_intercept,
+            }
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint_path", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--suite", choices=("in_distribution", "held_out_prior"), default="in_distribution")
-    parser.add_argument("--n_datasets", type=int, default=20)
+    parser.add_argument("--out_s11_1", required=True)
+    parser.add_argument("--out_s11_2", required=True)
+    parser.add_argument("--n_datasets", type=int, default=200)
     parser.add_argument("--n_rows", type=int, default=512)
-    parser.add_argument("--min_features", type=int, default=5)
-    parser.add_argument("--max_features", type=int, default=10)
+    parser.add_argument("--min_features", type=int, default=13)
+    parser.add_argument("--max_features", type=int, default=20)
     parser.add_argument("--n_oracle", type=int, default=512)
+    parser.add_argument(
+        "--mixture", default="backup", choices=("default", "backup"),
+        help="Conditioning-state mixture. 'backup' matches the training run "
+             "activated 2026-04-21 (preregistration §1 backup clause).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--log_every", type=int, default=10,
+        help="Print a progress line every N datasets.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    model = load_value_model(args.checkpoint_path, device=args.device)
-    if args.suite == "in_distribution":
-        suite = build_in_distribution_suite(
-            args.n_datasets,
-            args.seed,
-            n_rows=args.n_rows,
-            min_features=args.min_features,
-            max_features=args.max_features,
-            n_oracle=args.n_oracle,
+
+    checkpoint_path = Path(args.checkpoint_path)
+    if not checkpoint_path.exists():
+        print(f"[eval_heads] checkpoint not found: {checkpoint_path}", file=sys.stderr)
+        return 2
+
+    print(
+        f"[eval_heads] building in_distribution suite: "
+        f"n_datasets={args.n_datasets} p in [{args.min_features},{args.max_features}] "
+        f"n_rows={args.n_rows} n_oracle={args.n_oracle} mixture={args.mixture}",
+        flush=True,
+    )
+    suite = build_in_distribution_suite(
+        n_datasets=args.n_datasets,
+        seed=args.seed,
+        n_rows=args.n_rows,
+        min_features=args.min_features,
+        max_features=args.max_features,
+        n_oracle=args.n_oracle,
+        mixture=args.mixture,
+    )
+    print(f"[eval_heads] suite built: {len(suite.cases)} cases", flush=True)
+
+    rows_11_1: list[S11_1Row] = []
+    rows_11_2: list[S11_2Row] = []
+    all_s_pairs: list[tuple[float, float]] = []
+    all_n_pairs: list[tuple[float, float]] = []
+
+    for i, case in enumerate(suite.cases):
+        base = TabICLClassifier(device=args.device)
+        explainer = TabICLExplainer(
+            base_estimator=base,
+            heads_checkpoint_path=str(checkpoint_path),
+            device=args.device,
         )
-    else:
-        suite = build_held_out_prior_suite(
-            args.n_datasets,
-            args.seed,
-            n_rows=args.n_rows,
-            min_features=args.min_features,
-            max_features=args.max_features,
-            n_oracle=args.n_oracle,
-        )
-    rows = evaluate_value_model(model, suite)
-    write_rows_csv(args.out, rows)
+        ds_11_1, ds_11_2, s_pairs, n_pairs = evaluate_dataset(case, explainer)
+        rows_11_1.extend(ds_11_1)
+        rows_11_2.append(ds_11_2)
+        all_s_pairs.extend(s_pairs)
+        all_n_pairs.extend(n_pairs)
+
+        if (i + 1) % max(1, args.log_every) == 0 or i == 0 or (i + 1) == len(suite.cases):
+            print(
+                f"[eval_heads] {i+1}/{len(suite.cases)} p={case.X_train.shape[1]} "
+                f"rho_suff={ds_11_2.spearman_s:.3f} rho_nec={ds_11_2.spearman_n:.3f}",
+                flush=True,
+            )
+
+    write_s11_1(args.out_s11_1, rows_11_1)
+    write_s11_2(args.out_s11_2, rows_11_2, all_s_pairs, all_n_pairs)
+
+    # Terse grep summary for slurm log.
+    by_stratum_mean = {
+        stratum: _nanmean([r.spearman for r in rows_11_1 if r.stratum == stratum])
+        for stratum in STRATUM_ORDER
+    }
+    across_strata = _nanmean(list(by_stratum_mean.values()))
+    suff_mean = _nanmean([r.spearman_s for r in rows_11_2])
+    nec_mean = _nanmean([r.spearman_n for r in rows_11_2])
+    print(
+        "[eval_heads] §11.1 mean spearman per stratum: "
+        + " ".join(f"{k}={v:.3f}" for k, v in by_stratum_mean.items())
+        + f"  across_strata={across_strata:.3f}",
+        flush=True,
+    )
+    print(
+        f"[eval_heads] §11.2 mean: spearman_s={suff_mean:.3f} spearman_n={nec_mean:.3f}",
+        flush=True,
+    )
+    print(f"[eval_heads] wrote {args.out_s11_1} and {args.out_s11_2}", flush=True)
     return 0
 
 
