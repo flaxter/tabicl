@@ -175,6 +175,13 @@ class Trainer:
         if isinstance(col_feature_group, str) and col_feature_group.lower() == "false":
             col_feature_group = False
 
+        def _ssmax(v):
+            if isinstance(v, str) and v.lower() in {"false", "none", "off"}:
+                return False
+            if isinstance(v, str) and v.lower() == "true":
+                return True
+            return v
+
         self.model_config = {
             "max_classes": self.config.max_classes,
             "embed_dim": self.config.embed_dim,
@@ -182,12 +189,14 @@ class Trainer:
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
+            "col_ssmax": _ssmax(getattr(self.config, "col_ssmax", "qassmax-mlp-elementwise")),
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
             "row_num_cls": self.config.row_num_cls,
             "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
+            "icl_ssmax": _ssmax(getattr(self.config, "icl_ssmax", "qassmax-mlp-elementwise")),
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,

@@ -202,6 +202,21 @@ def build_parser():
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
+    # SSMax scaling — upstream v1/v1.1 checkpoints predate ssmax layers and
+    # need both flags set to False; v2 keeps the default 'qassmax-mlp-elementwise'.
+    parser.add_argument(
+        "--col_ssmax",
+        default="qassmax-mlp-elementwise",
+        type=str,
+        help="Column-attention SSMax scaling mode: False/'false'/'qassmax-mlp-elementwise'/'ssmax'/etc.",
+    )
+    parser.add_argument(
+        "--icl_ssmax",
+        default="qassmax-mlp-elementwise",
+        type=str,
+        help="ICL-attention SSMax scaling mode: same values as --col_ssmax.",
+    )
+
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability")
