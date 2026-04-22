@@ -409,8 +409,33 @@ class Trainer:
             raise ValueError("Checkpoint does not contain model state")
 
         load_strict = getattr(self.config, "load_model_strict", True)
+        state_dict = checkpoint["state_dict"]
+        if not load_strict:
+            # strict=False only ignores keys present in one side but not
+            # the other; it still raises on size-mismatches between
+            # keys present in both. When loading an upstream v1/v2
+            # checkpoint into a Phase-4 multi-task config, the y_encoder
+            # and decoder output-head tensors can disagree in shape
+            # (e.g. 1 regression target vs max_classes=10, 999 quantile
+            # bins vs 10 classes). Drop those keys so the load succeeds
+            # and the affected layers keep their fresh-init weights.
+            model_state = self.raw_model.state_dict()
+            dropped = []
+            filtered = {}
+            for k, v in state_dict.items():
+                if k in model_state and tuple(model_state[k].shape) != tuple(v.shape):
+                    dropped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+                    continue
+                filtered[k] = v
+            if dropped:
+                print(
+                    f"[load_checkpoint] dropping {len(dropped)} keys with size mismatch: "
+                    f"{dropped[:3]}{'...' if len(dropped) > 3 else ''}",
+                    flush=True,
+                )
+            state_dict = filtered
         missing, unexpected = self.raw_model.load_state_dict(
-            checkpoint["state_dict"], strict=load_strict
+            state_dict, strict=load_strict
         )
         if not load_strict:
             if missing:
