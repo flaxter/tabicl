@@ -140,6 +140,10 @@ def get_scheduler(config, optimizer):
             power=config.poly_decay_power,
         )
     else:
-        raise NotImplementedError
+        raise ValueError(
+            f"Unknown scheduler {config.scheduler!r}. Supported: "
+            f"'constant', 'linear_warmup', 'cosine_warmup', "
+            f"'cosine_with_restarts', 'polynomial_decay_warmup'."
+        )
 
     return scheduler
