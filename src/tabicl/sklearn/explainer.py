@@ -320,7 +320,15 @@ class TabICLExplainer(BaseEstimator):
         was_training = model.training
         model.eval()
         try:
-            with torch.no_grad():
+            # The base estimator's InferenceManager wraps each forward in
+            # `torch.autocast(device_type="cuda")` when use_amp is on (the
+            # default for non-small data). Autocast promotes ops to fp16
+            # regardless of the params we cast to fp32 above, so downstream
+            # LayerNorms can hit "expected Half but found Float" when
+            # normalising already-Half intermediate tensors against fp32
+            # weights. Explicitly disable autocast inside the attribution
+            # forward so the whole pipeline stays fp32.
+            with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=False):
                 _, column_embeddings = model(
                     X_t,
                     y_train=y_t,
