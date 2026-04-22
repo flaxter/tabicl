@@ -300,18 +300,30 @@ class TabICLExplainer(BaseEstimator):
         X_dummy_test = np.zeros((1, h_filtered), dtype=np.float32)
         X_cat = np.concatenate([X_train_filtered, X_dummy_test], axis=0)[None, ...]
 
-        # Force the whole trunk to fp32 for the attribution forward. The
-        # v2 regressor download arrives in fp16 but some submodules
-        # (notably the y_encoder built on-demand by target_aware=True)
-        # stay at fp32 random-init; the mismatch surfaces as
+        # Force the whole trunk to fp32 for the attribution forward and
+        # disable AMP on every InferenceManager so no sub-forward promotes
+        # back to fp16. The v1/v2 checkpoints download in fp16, and the
+        # each submodule (col_embedder/row_interactor/icl_predictor) owns
+        # its own InferenceManager that wraps forwards in
+        # `torch.autocast("cuda")` when use_amp is True (the default for
+        # non-small data). Without this belt-and-suspenders cast we see
         # "RuntimeError: expected scalar type Half but found Float" inside
-        # the row_interactor's LayerNorm even if we try to cast everything
-        # to the dominant dtype via `model.to(dtype=...)` — empirically
-        # that `.to()` call does not reliably cascade to every submodule
-        # (probably due to how submodules are registered on-demand).
-        # Going to fp32 unambiguously matches the heads' fp32 contract and
-        # is what the cached column embeddings end up as anyway.
-        model.float()
+        # row_interactor's LayerNorm because col_embedder's inference
+        # manager re-promotes to fp16 even though model.float() cast the
+        # params, and the row_interactor return_features=True path
+        # bypasses its own InferenceManager and calls LayerNorm directly.
+        #
+        # 1. Force every submodule's params+buffers to fp32.
+        for m in model.modules():
+            m.float()
+        # 2. Disable AMP on every InferenceManager so no nested forward
+        #    auto-promotes back to fp16.
+        for m in model.modules():
+            if hasattr(m, "inference_mgr"):
+                try:
+                    m.inference_mgr.use_amp = False
+                except AttributeError:
+                    pass
         X_t = torch.from_numpy(X_cat).float().to(self._device)
         y_t = torch.from_numpy(y_train_np[None, ...]).float().to(self._device)
 
