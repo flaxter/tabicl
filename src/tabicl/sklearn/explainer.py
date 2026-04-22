@@ -301,6 +301,14 @@ class TabICLExplainer(BaseEstimator):
         X_cat = np.concatenate([X_train_filtered, X_dummy_test], axis=0)[None, ...]
 
         trunk_dtype = next(model.parameters()).dtype
+        # Some upstream checkpoints (e.g. v2 regressor loaded with
+        # col_target_aware=True but without matching y_encoder keys in the
+        # state_dict) leave freshly-initialised submodules at fp32 while the
+        # rest of the trunk is fp16. That mismatch breaks downstream
+        # LayerNorm calls in the row_interactor with "expected scalar type
+        # Half but found Float". Force every submodule to the dominant
+        # trunk dtype so the internal pipeline is uniform.
+        model.to(dtype=trunk_dtype)
         X_t = torch.from_numpy(X_cat).to(self._device, dtype=trunk_dtype)
         y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device, dtype=trunk_dtype)
 
