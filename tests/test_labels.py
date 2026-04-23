@@ -9,10 +9,14 @@ from tabicl.prior.labels import (
     OracleContext,
     _binned_V,
     _direct_delta_cf_knn,
+    _direct_delta_cf_ridge,
+    _direct_delta_cf_kernel,
     V_gaussian,
     build_oracle_context,
     delta_gaussian,
     delta_vector_for_S_direct_knn,
+    delta_vector_for_S_direct_ridge,
+    delta_vector_for_S_direct_kernel,
     compute_value_queries,
     sample_value_queries_meta,
     ValueQuery,
@@ -469,3 +473,91 @@ def test_compute_value_queries_rejects_unknown_estimator():
             rng=np.random.default_rng(0),
             label_estimator="not_a_real_one",
         )
+
+
+@pytest.mark.parametrize("estimator,helper", [
+    ("direct_ridge", _direct_delta_cf_ridge),
+    ("direct_kernel", _direct_delta_cf_kernel),
+])
+def test_direct_delta_ridge_and_kernel_shape_contract(estimator, helper):
+    rng = np.random.default_rng(40)
+    X = rng.standard_normal((300, 5))
+    y = rng.standard_normal(300)
+    S = np.array([0, 2])
+    out = helper(X, y, S, p=5, n_folds=5, rng=np.random.default_rng(41))
+    assert np.isnan(out[0]) and np.isnan(out[2])
+    for i in [1, 3, 4]:
+        assert np.isfinite(out[i])
+        assert out[i] >= 0.0
+
+
+def test_direct_delta_ridge_recovers_linear_signal():
+    """Ridge direct-Delta should cleanly rank a linear SCM's features."""
+    rng = np.random.default_rng(50)
+    n = 500
+    X = rng.standard_normal((n, 4))
+    # Strongly linear in X[:, 0], weakly in X[:, 1], nothing else.
+    y = 2.0 * X[:, 0] + 0.3 * X[:, 1] + 0.1 * rng.standard_normal(n)
+    out = _direct_delta_cf_ridge(
+        X, y, np.zeros(0, dtype=int), p=4,
+        n_folds=5, rng=np.random.default_rng(51),
+    )
+    assert out[0] > out[1] > max(out[2], out[3])
+
+
+def test_direct_delta_kernel_nonneg_on_nonlinear_signal():
+    """Kernel nuisance should still produce nonneg Delta on a sin(x) SCM."""
+    rng = np.random.default_rng(60)
+    n = 400
+    X = rng.uniform(-3, 3, size=(n, 3))
+    y = np.sin(X[:, 0]) + 0.2 * rng.standard_normal(n)
+    out = _direct_delta_cf_kernel(
+        X, y, np.zeros(0, dtype=int), p=3,
+        n_folds=5, rng=np.random.default_rng(61),
+    )
+    assert out[0] >= 0.0 and out[1] >= 0.0 and out[2] >= 0.0
+    # The informative feature should dominate.
+    assert out[0] > out[1] and out[0] > out[2]
+
+
+def test_compute_value_queries_accepts_every_direct_estimator():
+    class _LinearSCM:
+        def simulate(self, n_samples, rng):
+            X = rng.standard_normal((n_samples, 3)).astype(np.float64)
+            y = (X[:, 0] + 0.3 * X[:, 1]).astype(np.float64)
+            return torch.from_numpy(X), torch.from_numpy(y)
+
+    for estimator in ("direct_knn", "direct_ridge", "direct_kernel"):
+        payload = compute_value_queries(
+            _LinearSCM(), torch.zeros(8, 3), torch.zeros(8),
+            n_oracle=256,
+            mixture="backup",
+            rng=np.random.default_rng(70),
+            label_estimator=estimator,
+            label_knn_folds=5,
+        )
+        assert len(payload["value_queries"]) > 0, estimator
+        for q in payload["value_queries"]:
+            raw = q.raw_targets.numpy()
+            S_mask = q.S_mask.numpy()
+            assert np.all(np.isnan(raw[S_mask])), estimator
+            assert np.all(raw[~S_mask] >= 0.0), estimator
+
+
+def test_direct_ridge_kernel_helpers_dispatch():
+    """delta_vector_for_S_direct_{ridge,kernel} pass through to the backends."""
+    rng = np.random.default_rng(80)
+
+    class _SimpleSCM:
+        def simulate(self, n_samples, rng):
+            X = rng.standard_normal((n_samples, 4)).astype(np.float64)
+            y = X[:, 0].astype(np.float64)
+            return torch.from_numpy(X), torch.from_numpy(y)
+
+    ctx = build_oracle_context(_SimpleSCM(), p=4, n_oracle=256, rng=rng)
+    S = np.array([3])
+    r = delta_vector_for_S_direct_ridge(ctx, S, rng=np.random.default_rng(81))
+    k = delta_vector_for_S_direct_kernel(ctx, S, rng=np.random.default_rng(82))
+    for out in (r, k):
+        assert np.isnan(out[3])
+        assert np.all(out[[0, 1, 2]] >= 0.0)

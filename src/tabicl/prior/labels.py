@@ -301,59 +301,89 @@ def delta_value(context: OracleContext, i: int, S: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _direct_delta_cf_knn(
+def _standardize_by_train(
+    Xtr: np.ndarray, Xte: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    mu = Xtr.mean(axis=0)
+    sd = Xtr.std(axis=0)
+    sd = np.where(sd < 1e-12, 1.0, sd)
+    return (Xtr - mu) / sd, (Xte - mu) / sd
+
+
+def _knn_fit_predict(k: Optional[int] = None):
+    """Build a ``fit_predict`` closure for :func:`_direct_delta_cf` (kNN)."""
+    def fp(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray) -> np.ndarray:
+        from sklearn.neighbors import KNeighborsRegressor
+        n_tr = Xtr.shape[0]
+        kk = k if k is not None else max(1, int(np.ceil(np.sqrt(n_tr))))
+        kk = min(kk, n_tr)
+        model = KNeighborsRegressor(n_neighbors=kk)
+        model.fit(Xtr, ytr)
+        return model.predict(Xte)
+    return fp
+
+
+def _ridge_fit_predict(alpha: float = 1.0):
+    """Build a ``fit_predict`` closure for :func:`_direct_delta_cf` (Ridge)."""
+    def fp(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray) -> np.ndarray:
+        from sklearn.linear_model import Ridge
+        model = Ridge(alpha=alpha)
+        model.fit(Xtr, ytr)
+        return model.predict(Xte)
+    return fp
+
+
+def _kernel_fit_predict(alpha: float = 1e-3, gamma: Optional[float] = None):
+    """Build a ``fit_predict`` closure (KernelRidge, RBF, median-heuristic).
+
+    If ``gamma`` is None, the bandwidth is set per fit from the median
+    pairwise distance on a random subsample of ``Xtr`` (cap 256 rows for
+    O(1) bandwidth cost, matches the smoketest kernel estimator).
+    """
+    def fp(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray) -> np.ndarray:
+        from sklearn.kernel_ridge import KernelRidge
+        from sklearn.metrics.pairwise import pairwise_distances
+        g = gamma
+        if g is None:
+            n_tr = Xtr.shape[0]
+            sub_n = min(256, n_tr)
+            if sub_n < 2:
+                g = 1.0
+            else:
+                sub = Xtr[:sub_n]
+                D = pairwise_distances(sub)
+                triu = D[np.triu_indices_from(D, k=1)]
+                triu = triu[triu > 0]
+                h = float(np.median(triu)) if triu.size else 1.0
+                g = 1.0 / (2.0 * max(h * h, 1e-12))
+        model = KernelRidge(alpha=alpha, kernel="rbf", gamma=g)
+        model.fit(Xtr, ytr)
+        return model.predict(Xte)
+    return fp
+
+
+def _direct_delta_cf(
     X: np.ndarray,
     y: np.ndarray,
     S: np.ndarray,
     p: int,
     *,
+    fit_predict,
     n_folds: int = 5,
-    k: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """Cross-fitted kNN estimator of the squared conditional-mean gap.
+    """Cross-fitted direct estimator of Delta_{i|S} = E[(mu_{S+i} - mu_S)^2].
 
-    Estimates the paper's direct identity
+    Generic over the nuisance regressor family: ``fit_predict`` is a
+    callable ``(Xtr_std, ytr, Xte_std) -> pred`` that handles one train/
+    test fold. Train-fold standardization of active coordinates is applied
+    upstream. For |S| = 0, mu_S uses the train-fold y-mean directly (no
+    regressor fit). Nonnegative by construction; NaN for ``i in S``.
 
-        Delta_{i|S} = E[(mu_{S union {i}}(X) - mu_S(X))^2]
-
-    for every candidate feature i in [p] simultaneously, using
-    ``n_folds``-fold cross-fitting of kNN nuisance regressors mu_T. The
-    held-out residual is averaged over all n rows, so each row contributes
-    once to the Monte-Carlo mean. Nonnegative by construction (no clip).
-
-    For |S| = 0 the nuisance mu_S equals the training-fold mean of y; no
-    neighbor search is done. Active coordinates are standardized on the
-    training fold only before the distance calculation.
-
-    Non-finite y rows are dropped before fold assignment. If fewer than
-    ``max(2, n_folds)`` finite rows remain, returns a zero vector with
-    NaN at ``i in S``.
-
-    Parameters
-    ----------
-    X : ndarray, shape (n, p)
-        Oracle-draw features.
-    y : ndarray, shape (n,)
-        Oracle-draw outcomes.
-    S : ndarray of int, shape (|S|,)
-        Conditioning-set indices.
-    p : int
-        Total feature count.
-    n_folds : int, default=5
-        Cross-fitting folds. ``n_folds=n`` emulates leave-one-out.
-    k : int, optional
-        Neighbor count. Defaults to ``ceil(sqrt(n_train))`` (REMEDY v1).
-    rng : np.random.Generator, optional
-        Controls the fold permutation.
-
-    Returns
-    -------
-    ndarray, shape (p,)
-        Delta_{i|S} estimate; NaN at ``i in S``.
+    Non-finite y rows (or rows with any non-finite X) are dropped before
+    fold assignment. If fewer than ``max(2, n_folds)`` rows remain, returns
+    0.0 for every valid candidate.
     """
-    from sklearn.neighbors import KNeighborsRegressor
-
     S = np.asarray(S, dtype=int)
     S_set = set(int(j) for j in S.tolist())
     rng = rng if rng is not None else np.random.default_rng()
@@ -380,12 +410,6 @@ def _direct_delta_cf_knn(
     mu_S_pred = np.empty(n, dtype=np.float64)
     mu_Si_pred = np.full((n, p), np.nan, dtype=np.float64)
 
-    def _standardize(Xtr: np.ndarray, Xte: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        mu = Xtr.mean(axis=0)
-        sd = Xtr.std(axis=0)
-        sd = np.where(sd < 1e-12, 1.0, sd)
-        return (Xtr - mu) / sd, (Xte - mu) / sd
-
     for f in range(n_folds):
         te = fold_ids == f
         tr = ~te
@@ -396,25 +420,18 @@ def _direct_delta_cf_knn(
         Xtr, ytr = X[tr], y[tr]
         Xte = X[te]
 
-        k_fold = k if k is not None else max(1, int(np.ceil(np.sqrt(n_tr))))
-        k_fold = min(k_fold, n_tr)
-
         if S.size == 0:
             mu_S_pred[te] = float(ytr.mean())
         else:
-            Xtr_S, Xte_S = _standardize(Xtr[:, S], Xte[:, S])
-            knn = KNeighborsRegressor(n_neighbors=k_fold)
-            knn.fit(Xtr_S, ytr)
-            mu_S_pred[te] = knn.predict(Xte_S)
+            Xtr_S, Xte_S = _standardize_by_train(Xtr[:, S], Xte[:, S])
+            mu_S_pred[te] = fit_predict(Xtr_S, ytr, Xte_S)
 
         for i in range(p):
             if i in S_set:
                 continue
             feats = np.concatenate([S, np.array([i], dtype=int)])
-            Xtr_Si, Xte_Si = _standardize(Xtr[:, feats], Xte[:, feats])
-            knn = KNeighborsRegressor(n_neighbors=k_fold)
-            knn.fit(Xtr_Si, ytr)
-            mu_Si_pred[te, i] = knn.predict(Xte_Si)
+            Xtr_Si, Xte_Si = _standardize_by_train(Xtr[:, feats], Xte[:, feats])
+            mu_Si_pred[te, i] = fit_predict(Xtr_Si, ytr, Xte_Si)
 
     for i in range(p):
         if i in S_set:
@@ -422,6 +439,75 @@ def _direct_delta_cf_knn(
         diff = mu_Si_pred[:, i] - mu_S_pred
         out[i] = float(np.mean(diff * diff))
     return out
+
+
+def _direct_delta_cf_knn(
+    X: np.ndarray,
+    y: np.ndarray,
+    S: np.ndarray,
+    p: int,
+    *,
+    n_folds: int = 5,
+    k: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Cross-fitted kNN direct estimator of Delta_{i|S} (REMEDY v1).
+
+    Thin wrapper on :func:`_direct_delta_cf` with the kNN nuisance. Default
+    ``k = ceil(sqrt(n_train))``.
+    """
+    return _direct_delta_cf(
+        X, y, S, p,
+        fit_predict=_knn_fit_predict(k),
+        n_folds=n_folds, rng=rng,
+    )
+
+
+def _direct_delta_cf_ridge(
+    X: np.ndarray,
+    y: np.ndarray,
+    S: np.ndarray,
+    p: int,
+    *,
+    n_folds: int = 5,
+    alpha: float = 1.0,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Cross-fitted ridge-regression direct estimator of Delta_{i|S}.
+
+    Linear nuisance; fastest of the three variants, lower bias when the
+    conditional mean is close to linear in the active coordinates, higher
+    bias otherwise. Standard alpha=1.0 on standardized features.
+    """
+    return _direct_delta_cf(
+        X, y, S, p,
+        fit_predict=_ridge_fit_predict(alpha),
+        n_folds=n_folds, rng=rng,
+    )
+
+
+def _direct_delta_cf_kernel(
+    X: np.ndarray,
+    y: np.ndarray,
+    S: np.ndarray,
+    p: int,
+    *,
+    n_folds: int = 5,
+    alpha: float = 1e-3,
+    gamma: Optional[float] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Cross-fitted RBF kernel-ridge direct estimator of Delta_{i|S}.
+
+    Nonparametric nuisance with median-heuristic bandwidth (if
+    ``gamma=None``). Higher bias control than ridge, higher variance than
+    kNN for wide S.
+    """
+    return _direct_delta_cf(
+        X, y, S, p,
+        fit_predict=_kernel_fit_predict(alpha, gamma),
+        n_folds=n_folds, rng=rng,
+    )
 
 
 def delta_vector_for_S_direct_knn(
@@ -432,11 +518,44 @@ def delta_vector_for_S_direct_knn(
     k: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """Direct-Delta counterpart to :func:`delta_vector_for_S`."""
+    """Direct-Delta counterpart to :func:`delta_vector_for_S` (kNN nuisance)."""
     p = int(context.X.shape[1])
     return _direct_delta_cf_knn(
         context.X, context.y, np.asarray(S, dtype=int), p,
         n_folds=n_folds, k=k, rng=rng,
+    )
+
+
+def delta_vector_for_S_direct_ridge(
+    context: OracleContext,
+    S: np.ndarray,
+    *,
+    n_folds: int = 5,
+    alpha: float = 1.0,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Direct-Delta counterpart with ridge-regression nuisance."""
+    p = int(context.X.shape[1])
+    return _direct_delta_cf_ridge(
+        context.X, context.y, np.asarray(S, dtype=int), p,
+        n_folds=n_folds, alpha=alpha, rng=rng,
+    )
+
+
+def delta_vector_for_S_direct_kernel(
+    context: OracleContext,
+    S: np.ndarray,
+    *,
+    n_folds: int = 5,
+    alpha: float = 1e-3,
+    gamma: Optional[float] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Direct-Delta counterpart with RBF kernel-ridge nuisance."""
+    p = int(context.X.shape[1])
+    return _direct_delta_cf_kernel(
+        context.X, context.y, np.asarray(S, dtype=int), p,
+        n_folds=n_folds, alpha=alpha, gamma=gamma, rng=rng,
     )
 
 
@@ -487,14 +606,14 @@ def compute_value_queries(
         Conditioning-state mixture (§7.2 locked default, thinned backup).
     n_bins : int
         Quantile bins per feature for the plug-in estimator.
-    label_estimator : {"histogram", "direct_knn"}
-        Which V(S)/Delta estimator to use. ``"histogram"`` uses the legacy
+    label_estimator : {"histogram", "direct_knn", "direct_ridge", "direct_kernel"}
+        Which Delta_{i|S} estimator to use. ``"histogram"`` is the legacy
         quantile-binning plug-in of ``V(S) = Var(E[Y|X_S])`` and differences
-        it (the original §7.3 path). ``"direct_knn"`` uses the cross-fitted
-        kNN direct estimate of the squared conditional-mean gap
-        (REMEDY.md v1; nonnegative by construction, no max(.,0) clip).
+        (§7.3). The ``"direct_*"`` variants all estimate the paper's direct
+        identity E[(mu_{S+i}-mu_S)^2] with cross-fitted nuisance regressors
+        (REMEDY.md); nonnegative by construction, no max(.,0) clip.
     label_knn_folds : int
-        Cross-fitting folds for ``label_estimator="direct_knn"``.
+        Cross-fitting folds for the direct-Delta variants.
     label_knn_k : int, optional
         Neighbor count for ``label_estimator="direct_knn"``. Default
         ``ceil(sqrt(n_train))``.
@@ -523,20 +642,33 @@ def compute_value_queries(
     except ValueError:
         return _empty_value_labels(p)
 
-    if label_estimator not in ("histogram", "direct_knn"):
+    valid_estimators = ("histogram", "direct_knn", "direct_ridge", "direct_kernel")
+    if label_estimator not in valid_estimators:
         raise ValueError(
-            f"label_estimator must be 'histogram' or 'direct_knn'; got {label_estimator!r}"
+            f"label_estimator must be one of {valid_estimators}; got {label_estimator!r}"
         )
 
     queries: List[ValueQuery] = []
     for S, query_type in sample_value_queries_meta(p, rng, mixture=mixture):
         if label_estimator == "histogram":
             raw = delta_vector_for_S(context, S)
-        else:
+        elif label_estimator == "direct_knn":
             raw = delta_vector_for_S_direct_knn(
                 context, S,
                 n_folds=label_knn_folds,
                 k=label_knn_k,
+                rng=rng,
+            )
+        elif label_estimator == "direct_ridge":
+            raw = delta_vector_for_S_direct_ridge(
+                context, S,
+                n_folds=label_knn_folds,
+                rng=rng,
+            )
+        else:  # direct_kernel
+            raw = delta_vector_for_S_direct_kernel(
+                context, S,
+                n_folds=label_knn_folds,
                 rng=rng,
             )
         targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
