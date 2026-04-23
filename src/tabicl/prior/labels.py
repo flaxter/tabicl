@@ -641,7 +641,7 @@ def compute_value_queries(
     dict with keys:
       ``value_queries`` : list[ValueQuery]
       ``y_var_raw``     : float, total outcome variance (oracle draw)
-      ``label_scale``   : str, ``"rms_y_units"``
+      ``label_scale``   : str, ``"rms_normalized"`` (targets in [0, 1], scaled by sqrt(Var(Y)))
     """
     rng = rng if rng is not None else np.random.default_rng()
     p = int(X.shape[-1])
@@ -689,15 +689,17 @@ def compute_value_queries(
                 n_folds=label_knn_folds,
                 rng=rng,
             )
-        # Cap raw Delta at Var(Y). Law of total variance gives
-        # Delta_{i|S} = Var(E[Y|X_{S+i}]) - Var(E[Y|X_S]) <= Var(Y) always;
-        # any estimate above y_var is finite-sample noise. Uncapped direct-
-        # Delta estimates have produced 1e10-magnitude outliers on heavy-
-        # tailed draws and destroyed training. The cap is a no-op on
-        # well-behaved draws.
+        # Cap + normalize. Law of total variance gives Delta_{i|S} <= Var(Y),
+        # so we cap raw at y_var (a no-op for well-behaved estimators) and
+        # divide by y_var so training sees a scale-free signal in [0, 1].
+        # Absolute-scale targets caused head divergence: Var(Y) varies by
+        # 5+ orders of magnitude across SCM draws, and one batch with a
+        # large-variance SCM blows the head up even after the y_var cap.
+        # Ranks and within-SCM relative magnitudes are preserved; absolute
+        # scale is recoverable at inference by multiplying by sqrt(y_var).
         if np.isfinite(context.y_var) and context.y_var > 0:
             cap = float(context.y_var)
-            raw = np.where(np.isfinite(raw), np.minimum(raw, cap), raw)
+            raw = np.where(np.isfinite(raw), np.minimum(raw, cap) / cap, raw)
         targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
         S_mask = torch.zeros(p, dtype=torch.bool)
         if S.size > 0:
@@ -714,7 +716,7 @@ def compute_value_queries(
     return {
         "value_queries": queries,
         "y_var_raw": context.y_var,
-        "label_scale": "rms_y_units",
+        "label_scale": "rms_normalized",
     }
 
 
@@ -723,5 +725,5 @@ def _empty_value_labels(p: int) -> Dict[str, Any]:
     return {
         "value_queries": [],
         "y_var_raw": float("nan"),
-        "label_scale": "rms_y_units",
+        "label_scale": "rms_normalized",
     }

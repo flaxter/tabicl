@@ -520,31 +520,43 @@ def test_direct_delta_kernel_nonneg_on_nonlinear_signal():
     assert out[0] > out[1] and out[0] > out[2]
 
 
-def test_compute_value_queries_caps_labels_at_y_variance():
-    """Raw Delta estimates must not exceed Var(Y) (theoretical upper bound)."""
-    class _HeavyTailSCM:
+def test_compute_value_queries_normalizes_labels_to_unit_range():
+    """raw and target must be in [0, 1] regardless of Var(Y) scale.
+
+    Absolute-scale targets blew up fine-tuning on heavy-tailed mlp_scm
+    draws (loss_value spiked to 1e11); per-SCM normalization by y_var
+    puts every draw on the same footing.
+    """
+    class _WildScaleSCM:
+        def __init__(self, scale):
+            self.scale = scale
+
         def simulate(self, n_samples, rng):
             X = rng.standard_normal((n_samples, 4)).astype(np.float64)
-            # Heavy-tailed Y to trigger finite-sample estimator blow-ups.
-            y = (X[:, 0] ** 5 + 0.1 * rng.standard_normal(n_samples)).astype(np.float64)
+            y = (self.scale * (X[:, 0] ** 5) + 0.1 * rng.standard_normal(n_samples)).astype(np.float64)
             return torch.from_numpy(X), torch.from_numpy(y)
 
-    payload = compute_value_queries(
-        _HeavyTailSCM(), torch.zeros(8, 4), torch.zeros(8),
-        n_oracle=256,
-        mixture="backup",
-        rng=np.random.default_rng(100),
-        label_estimator="direct_knn",
-    )
-    y_var = payload["y_var_raw"]
-    assert y_var > 0
-    for q in payload["value_queries"]:
-        raw = q.raw_targets.numpy()
-        finite_raw = raw[np.isfinite(raw)]
-        # Every finite raw entry must be at or below y_var plus a tiny epsilon.
-        assert np.all(finite_raw <= y_var + 1e-6), (
-            f"raw max {finite_raw.max()} exceeded y_var {y_var}"
+    for scale in (1e-3, 1.0, 1e3, 1e6):
+        payload = compute_value_queries(
+            _WildScaleSCM(scale=scale), torch.zeros(8, 4), torch.zeros(8),
+            n_oracle=256,
+            mixture="backup",
+            rng=np.random.default_rng(100),
+            label_estimator="direct_knn",
         )
+        assert payload["label_scale"] == "rms_normalized"
+        for q in payload["value_queries"]:
+            raw = q.raw_targets.numpy()
+            tgt = q.targets.numpy()
+            finite_raw = raw[np.isfinite(raw)]
+            finite_tgt = tgt[np.isfinite(tgt)]
+            assert finite_raw.min() >= 0.0
+            assert finite_raw.max() <= 1.0 + 1e-6, (
+                f"scale={scale}: raw max {finite_raw.max()} > 1"
+            )
+            assert finite_tgt.max() <= 1.0 + 1e-6, (
+                f"scale={scale}: target max {finite_tgt.max()} > 1"
+            )
 
 
 def test_compute_value_queries_accepts_every_direct_estimator():
