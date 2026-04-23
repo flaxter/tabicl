@@ -159,6 +159,40 @@ def build_parser():
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
 
+    # Label path (REMEDY.md): overrides for scm_fixed_hp at genload time.
+    parser.add_argument(
+        "--label_estimator",
+        default=None,
+        type=str,
+        choices=["histogram", "direct_knn", "direct_ridge", "direct_kernel"],
+        help="Override scm_fixed_hp['label_estimator']. None leaves the default (histogram).",
+    )
+    parser.add_argument(
+        "--label_mixture",
+        default=None,
+        type=str,
+        choices=["default", "backup", "easy"],
+        help="Override scm_fixed_hp['label_mixture']. None leaves the config default (backup).",
+    )
+    parser.add_argument(
+        "--label_n_oracle",
+        default=None,
+        type=int,
+        help="Override scm_fixed_hp['label_n_oracle']. Default 512.",
+    )
+    parser.add_argument(
+        "--label_knn_folds",
+        default=None,
+        type=int,
+        help="Override scm_fixed_hp['label_knn_folds'] for direct-Delta estimators. Default 5.",
+    )
+    parser.add_argument(
+        "--label_knn_k",
+        default=None,
+        type=int,
+        help="Override scm_fixed_hp['label_knn_k']. Default ceil(sqrt(n_train)).",
+    )
+
     ###########################################################################
     ##### Model Architecture Config ###########################################
     ###########################################################################

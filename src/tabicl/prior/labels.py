@@ -144,6 +144,15 @@ _BACKUP_MIXTURE: Tuple[Tuple[str, int, str], ...] = (
     ("medium", 1, "medium"),
     ("near_full", 1, "near_full"),
 )
+# Easy-strata mixture (REMEDY Phase 3): train only where labels are trustworthy.
+# Medium and near_full are stripped because the cross-fitted direct-Delta
+# estimator still has materially more variance on wide S; this isolates
+# whether the method works where supervision is cleanest.
+_EASY_MIXTURE: Tuple[Tuple[str, int, str], ...] = (
+    ("empty", 1, "zero"),
+    ("singleton", 2, "one"),
+    ("small", 3, "small"),
+)
 
 
 def _draw_S(p: int, size_spec: str, rng: np.random.Generator) -> np.ndarray:
@@ -177,7 +186,16 @@ def sample_value_queries_meta(
     mixture: str = "default",
 ) -> List[Tuple[np.ndarray, str]]:
     """Return a list of ``(S, query_type)`` pairs sampled from the mixture."""
-    spec = _DEFAULT_MIXTURE if mixture == "default" else _BACKUP_MIXTURE
+    if mixture == "default":
+        spec = _DEFAULT_MIXTURE
+    elif mixture == "backup":
+        spec = _BACKUP_MIXTURE
+    elif mixture == "easy":
+        spec = _EASY_MIXTURE
+    else:
+        raise ValueError(
+            f"mixture must be 'default', 'backup', or 'easy'; got {mixture!r}"
+        )
     out: List[Tuple[np.ndarray, str]] = []
     for query_type, count, size_spec in spec:
         for _ in range(count):

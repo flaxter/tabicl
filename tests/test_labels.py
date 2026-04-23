@@ -544,6 +544,22 @@ def test_compute_value_queries_accepts_every_direct_estimator():
             assert np.all(raw[~S_mask] >= 0.0), estimator
 
 
+def test_easy_mixture_strips_medium_and_near_full():
+    """REMEDY Phase 3: the 'easy' mixture excludes medium and near_full."""
+    rng = np.random.default_rng(90)
+    queries = sample_value_queries_meta(p=16, rng=rng, mixture="easy")
+    types = [qt for _, qt in queries]
+    assert set(types) <= {"empty", "singleton", "small"}
+    assert types.count("empty") == 1
+    assert types.count("singleton") == 2
+    assert types.count("small") == 3
+
+
+def test_sample_value_queries_meta_rejects_unknown_mixture():
+    with pytest.raises(ValueError, match="mixture"):
+        sample_value_queries_meta(p=8, rng=np.random.default_rng(0), mixture="weird")
+
+
 def test_direct_ridge_kernel_helpers_dispatch():
     """delta_vector_for_S_direct_{ridge,kernel} pass through to the backends."""
     rng = np.random.default_rng(80)

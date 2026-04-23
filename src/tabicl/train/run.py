@@ -298,6 +298,32 @@ class Trainer:
         """Set up a tabular dataset generator for synthetic data during training."""
 
         if self.config.prior_dir is None:
+            from tabicl.prior.prior_config import DEFAULT_FIXED_HP
+            fixed_hp_overrides = dict(DEFAULT_FIXED_HP)
+            for key in (
+                "label_estimator",
+                "label_mixture",
+                "label_n_oracle",
+                "label_knn_folds",
+                "label_knn_k",
+            ):
+                val = getattr(self.config, key, None)
+                if val is not None:
+                    fixed_hp_overrides[key] = val
+            if self.master_process and any(
+                getattr(self.config, k, None) is not None
+                for k in ("label_estimator", "label_mixture",
+                          "label_n_oracle", "label_knn_folds", "label_knn_k")
+            ):
+                print(
+                    "[labels] overrides:",
+                    {
+                        k: fixed_hp_overrides.get(k)
+                        for k in ("label_estimator", "label_mixture",
+                                  "label_n_oracle", "label_knn_folds", "label_knn_k")
+                    },
+                )
+
             # Generate prior data on the fly
             dataset = PriorDataset(
                 batch_size=self.config.batch_size,
@@ -313,6 +339,7 @@ class Trainer:
                 max_train_size=self.config.max_train_size,
                 replay_small=self.config.replay_small,
                 prior_type=self.config.prior_type,
+                scm_fixed_hp=fixed_hp_overrides,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
             )
