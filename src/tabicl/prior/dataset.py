@@ -585,7 +585,7 @@ class SCMPrior(Prior):
                 labels = {
                     "value_queries": [],
                     "y_var_raw": float("nan"),
-                    "label_scale": "rms_normalized",
+                    "label_scale": "rms_y_units",
                 }
 
             X, y = Reg2Cls(params)(X_raw, y_raw)

@@ -521,11 +521,12 @@ def test_direct_delta_kernel_nonneg_on_nonlinear_signal():
 
 
 def test_compute_value_queries_normalizes_labels_to_unit_range():
-    """raw and target must be in [0, 1] regardless of Var(Y) scale.
+    """Targets must be in [0, 1] AND per query must USE the full range.
 
-    Absolute-scale targets blew up fine-tuning on heavy-tailed mlp_scm
-    draws (loss_value spiked to 1e11); per-SCM normalization by y_var
-    puts every draw on the same footing.
+    Per-query max-normalization puts the top-Delta candidate at target=1
+    within each S, giving the head a signal to learn ranks. Previous
+    /y_var normalization compressed most targets near 0 (pred_std ~0.02
+    after 500 steps), which failed Phase-3 training.
     """
     class _WildScaleSCM:
         def __init__(self, scale):
@@ -554,9 +555,13 @@ def test_compute_value_queries_normalizes_labels_to_unit_range():
             assert finite_raw.max() <= 1.0 + 1e-6, (
                 f"scale={scale}: raw max {finite_raw.max()} > 1"
             )
-            assert finite_tgt.max() <= 1.0 + 1e-6, (
-                f"scale={scale}: target max {finite_tgt.max()} > 1"
-            )
+            # Per-query max-normalize guarantees at least one target at 1.0
+            # (up to precision) when any finite Delta > 0.
+            if finite_tgt.size > 0 and finite_tgt.max() > 0:
+                assert finite_tgt.max() >= 0.99, (
+                    f"scale={scale}: target max {finite_tgt.max()} < 0.99 "
+                    "- per-query max normalization should saturate"
+                )
 
 
 def test_compute_value_queries_accepts_every_direct_estimator():

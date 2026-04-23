@@ -689,18 +689,33 @@ def compute_value_queries(
                 n_folds=label_knn_folds,
                 rng=rng,
             )
-        # Cap + normalize. Law of total variance gives Delta_{i|S} <= Var(Y),
-        # so we cap raw at y_var (a no-op for well-behaved estimators) and
-        # divide by y_var so training sees a scale-free signal in [0, 1].
-        # Absolute-scale targets caused head divergence: Var(Y) varies by
-        # 5+ orders of magnitude across SCM draws, and one batch with a
-        # large-variance SCM blows the head up even after the y_var cap.
-        # Ranks and within-SCM relative magnitudes are preserved; absolute
-        # scale is recoverable at inference by multiplying by sqrt(y_var).
-        if np.isfinite(context.y_var) and context.y_var > 0:
-            cap = float(context.y_var)
-            raw = np.where(np.isfinite(raw), np.minimum(raw, cap) / cap, raw)
-        targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
+        # Direct-Delta estimators only: cap at y_var then per-query max-
+        # normalize so each S has max target = 1.0. Rationale: unnormalized
+        # direct estimates have heavy-tailed outliers that blow training up
+        # (1e10-1e11 loss spikes), and naive /y_var compresses most targets
+        # near 0 so the head learns a trivial constant. Per-query max-norm
+        # preserves within-S ranks and forces the head to use the [0, 1]
+        # range — the rank-Spearman metric we care about is scale-invariant,
+        # so the magnitude change is harmless for eval.
+        # Histogram is left untouched: its natural bound Delta <= y_var holds
+        # by construction, and v1.1 checkpoints were trained on unnormalized
+        # histogram labels.
+        if label_estimator in ("direct_knn", "direct_ridge", "direct_kernel"):
+            finite_mask = np.isfinite(raw)
+            if finite_mask.any():
+                if np.isfinite(context.y_var) and context.y_var > 0:
+                    raw = np.where(
+                        finite_mask,
+                        np.minimum(raw, float(context.y_var)),
+                        raw,
+                    )
+                raw_valid = raw[finite_mask]
+                raw_max = float(np.max(raw_valid)) if raw_valid.size else 0.0
+                if raw_max > 1e-12:
+                    raw = np.where(finite_mask, raw / raw_max, raw)
+            targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=1.0))
+        else:
+            targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
         S_mask = torch.zeros(p, dtype=torch.bool)
         if S.size > 0:
             S_mask[torch.as_tensor(S, dtype=torch.long)] = True
@@ -716,7 +731,11 @@ def compute_value_queries(
     return {
         "value_queries": queries,
         "y_var_raw": context.y_var,
-        "label_scale": "rms_normalized",
+        "label_scale": (
+            "rms_normalized"
+            if label_estimator in ("direct_knn", "direct_ridge", "direct_kernel")
+            else "rms_y_units"
+        ),
     }
 
 
