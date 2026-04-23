@@ -199,25 +199,36 @@ def _quantile_bin(x: np.ndarray, n_bins: int) -> np.ndarray:
 
 
 def _binned_V(col_bins: np.ndarray, y: np.ndarray, S: np.ndarray) -> float:
-    """Plug-in estimator of Var(E[Y | X_S]) from pre-binned columns."""
+    """Plug-in estimator of Var(E[Y | X_S]) from pre-binned columns.
+
+    Non-finite ``y`` rows are dropped before grouping. Group identities are
+    formed with ``np.unique(..., axis=0)`` instead of an int64 flattening
+    trick so high-dimensional states cannot overflow the key space.
+    """
     if S.size == 0:
         return 0.0
-    keys = col_bins[:, S]
-    flat = np.zeros(keys.shape[0], dtype=np.int64)
-    for col in range(keys.shape[1]):
-        flat = flat * 10 + keys[:, col]
-    order = np.argsort(flat)
-    sorted_flat = flat[order]
-    sorted_y = y[order]
-    split = np.where(np.diff(sorted_flat) != 0)[0] + 1
-    groups = np.split(sorted_y, split)
-    means = np.array([float(np.mean(g)) for g in groups])
-    counts = np.array([g.size for g in groups], dtype=np.float64)
+    keys = np.asarray(col_bins[:, S])
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(y)
+    if not finite.any():
+        return 0.0
+    keys = keys[finite]
+    y = y[finite]
+    if y.size == 0:
+        return 0.0
+
+    _, inverse, counts = np.unique(
+        keys, axis=0, return_inverse=True, return_counts=True
+    )
+    counts = counts.astype(np.float64, copy=False)
+    sums = np.bincount(inverse, weights=y, minlength=counts.size)
+    means = sums / counts
     total = counts.sum()
     if total <= 0:
         return 0.0
     overall = float(np.sum(means * counts) / total)
-    return float(np.sum(counts * (means - overall) ** 2) / total)
+    value = float(np.sum(counts * (means - overall) ** 2) / total)
+    return max(0.0, value)
 
 
 def build_oracle_context(
@@ -245,6 +256,9 @@ def build_oracle_context(
     y_base = np.asarray(y_base, dtype=np.float64).reshape(-1)
     if X_base.ndim != 2 or X_base.shape[1] != p:
         raise ValueError(f"oracle sample must have shape (n, {p}); got {X_base.shape}")
+    finite_y = y_base[np.isfinite(y_base)]
+    if finite_y.size < 2:
+        raise ValueError("oracle sample has fewer than 2 finite y values")
 
     col_bins = np.stack(
         [_quantile_bin(X_base[:, j], n_bins=n_bins) for j in range(p)], axis=1
@@ -253,7 +267,7 @@ def build_oracle_context(
         X=X_base,
         y=y_base,
         col_bins=col_bins,
-        y_var=float(np.var(y_base)),
+        y_var=float(np.var(finite_y)),
     )
 
 

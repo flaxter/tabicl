@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from tabicl.prior.labels import (
+    _binned_V,
     V_gaussian,
     delta_gaussian,
     compute_value_queries,
@@ -248,3 +249,51 @@ def test_targets_are_rms_sqrt_of_raw():
             torch.sqrt(torch.clamp(q.raw_targets[finite], min=0)),
             atol=1e-6,
         )
+
+
+def test_binned_V_ignores_nonfinite_y():
+    col_bins = np.array(
+        [
+            [0, 0],
+            [0, 0],
+            [1, 1],
+            [1, 1],
+        ],
+        dtype=np.int64,
+    )
+    y = np.array([1.0, np.inf, 3.0, 5.0], dtype=np.float64)
+    got = _binned_V(col_bins, y, np.array([0, 1], dtype=int))
+    assert got == pytest.approx(2.0)
+
+
+def test_binned_V_wide_state_does_not_overflow_group_keys():
+    col_bins = np.array(
+        [
+            [0] * 20,
+            [0] * 20,
+            [9] * 19 + [8],
+            [9] * 19 + [9],
+        ],
+        dtype=np.int64,
+    )
+    y = np.array([0.0, 2.0, 4.0, 6.0], dtype=np.float64)
+    got = _binned_V(col_bins, y, np.arange(20, dtype=int))
+    assert got == pytest.approx(4.5)
+
+
+class _AllInfYSCM:
+    def simulate(self, n_samples: int, rng: np.random.Generator):
+        X = rng.standard_normal((n_samples, 3))
+        Y = np.full(n_samples, np.inf)
+        return torch.from_numpy(X), torch.from_numpy(Y)
+
+
+def test_compute_value_queries_returns_empty_for_nonfinite_oracle_y():
+    scm = _AllInfYSCM()
+    X = torch.zeros(16, 3)
+    y = torch.zeros(16)
+    payload = compute_value_queries(
+        scm, X, y, n_oracle=128, rng=np.random.default_rng(0)
+    )
+    assert payload["value_queries"] == []
+    assert np.isnan(payload["y_var_raw"])
