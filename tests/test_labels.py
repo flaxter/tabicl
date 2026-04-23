@@ -6,9 +6,13 @@ import pytest
 import torch
 
 from tabicl.prior.labels import (
+    OracleContext,
     _binned_V,
+    _direct_delta_cf_knn,
     V_gaussian,
+    build_oracle_context,
     delta_gaussian,
+    delta_vector_for_S_direct_knn,
     compute_value_queries,
     sample_value_queries_meta,
     ValueQuery,
@@ -297,3 +301,171 @@ def test_compute_value_queries_returns_empty_for_nonfinite_oracle_y():
     )
     assert payload["value_queries"] == []
     assert np.isnan(payload["y_var_raw"])
+
+
+# ---------------------------------------------------------------------------
+# _direct_delta_cf_knn — REMEDY.md v1
+# ---------------------------------------------------------------------------
+
+
+def _gaussian_scm_sample(Sigma: np.ndarray, y_idx: int, n: int, seed: int):
+    """Draw (X, y) from a jointly Gaussian (X, Y) with covariance Sigma."""
+    rng = np.random.default_rng(seed)
+    p = Sigma.shape[0] - 1
+    Z = rng.multivariate_normal(np.zeros(Sigma.shape[0]), Sigma, size=n)
+    X = np.delete(Z, y_idx, axis=1)
+    y = Z[:, y_idx]
+    return X.astype(np.float64), y.astype(np.float64), p
+
+
+def test_direct_delta_nan_for_i_in_S():
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((200, 4))
+    y = rng.standard_normal(200)
+    out = _direct_delta_cf_knn(X, y, np.array([0, 2]), p=4, rng=np.random.default_rng(1))
+    assert np.isnan(out[0]) and np.isnan(out[2])
+    assert np.isfinite(out[1]) and np.isfinite(out[3])
+
+
+def test_direct_delta_nonnegative_without_clip():
+    rng = np.random.default_rng(2)
+    X = rng.standard_normal((300, 5))
+    y = rng.standard_normal(300)
+    out = _direct_delta_cf_knn(X, y, np.array([1]), p=5, rng=np.random.default_rng(3))
+    for i in [0, 2, 3, 4]:
+        assert out[i] >= 0.0
+
+
+def test_direct_delta_empty_S_uses_train_mean():
+    """|S|=0 should not do a neighbor search; mu_S == train-fold y mean.
+
+    Check shape: estimator should be bounded by Var(Y) (for any candidate i)
+    and positive for a feature that carries signal.
+    """
+    rng = np.random.default_rng(4)
+    n = 400
+    x1 = rng.standard_normal(n)
+    x2 = rng.standard_normal(n)
+    noise = 0.3 * rng.standard_normal(n)
+    y = 2.0 * x1 + 0.0 * x2 + noise  # x1 drives y, x2 is noise
+    X = np.stack([x1, x2], axis=1)
+    out = _direct_delta_cf_knn(
+        X, y, np.zeros(0, dtype=int), p=2, n_folds=5, rng=np.random.default_rng(5)
+    )
+    assert out[0] > out[1]  # x1 beats the noise feature
+    assert out[0] > 0.5     # material signal for x1
+    assert 0 <= out[1] < 0.5  # x2 near zero but nonnegative
+
+
+def test_direct_delta_wide_S_is_not_identically_zero():
+    """Under the histogram plug-in, |S| ~ p/2 collapses to flat zeros. The
+    cross-fitted estimator should produce meaningful spread across candidate
+    features on a simple SCM with non-trivial structure."""
+    rng = np.random.default_rng(6)
+    n = 400
+    p = 10
+    X = rng.standard_normal((n, p))
+    # y depends on all features with decaying weights -- every candidate
+    # feature in S-complement should still carry *some* signal.
+    coefs = np.array([1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.05, 0.0, 0.0, 0.0])
+    y = X @ coefs + 0.2 * rng.standard_normal(n)
+    S = np.array([0, 1, 2, 3])  # medium state
+    out = _direct_delta_cf_knn(X, y, S, p=p, n_folds=5, rng=np.random.default_rng(7))
+    non_s = [i for i in range(p) if i not in set(S.tolist())]
+    vals = out[non_s]
+    assert np.all(np.isfinite(vals))
+    assert np.all(vals >= 0.0)
+    assert float(np.std(vals)) > 0.0  # not flat
+
+
+def test_direct_delta_ranks_gaussian_closed_form():
+    """On a jointly-Gaussian SCM, the direct-Delta ranking across candidate
+    features should agree with delta_gaussian ranking (Spearman positive)."""
+    from scipy.stats import spearmanr
+
+    rng = np.random.default_rng(11)
+    p = 5
+    A = rng.standard_normal((p + 1, p + 1))
+    Sigma = A @ A.T + 0.5 * np.eye(p + 1)
+    y_idx = p  # Y is last coordinate
+
+    X, y, _ = _gaussian_scm_sample(Sigma, y_idx, n=2000, seed=12)
+
+    # Empty-S candidate vector
+    S = np.zeros(0, dtype=int)
+    est = _direct_delta_cf_knn(X, y, S, p=p, n_folds=5, rng=np.random.default_rng(13))
+    ref = np.array([delta_gaussian(Sigma, y_idx, i, S) for i in range(p)])
+    rho, _ = spearmanr(est, ref)
+    assert rho > 0.7, f"expected rho > 0.7, got {rho:.3f}"
+
+    # Non-empty S: pick one feature out and check ranking on the rest
+    S = np.array([0])
+    est = _direct_delta_cf_knn(X, y, S, p=p, n_folds=5, rng=np.random.default_rng(14))
+    ref = np.array([delta_gaussian(Sigma, y_idx, i, S) for i in range(p)])
+    mask = np.array([i not in set(S.tolist()) for i in range(p)])
+    rho, _ = spearmanr(est[mask], ref[mask])
+    assert rho > 0.7, f"expected rho > 0.7 on |S|=1, got {rho:.3f}"
+
+
+def test_direct_delta_vector_for_S_matches_helper(monkeypatch):
+    """delta_vector_for_S_direct_knn dispatches to _direct_delta_cf_knn."""
+    rng = np.random.default_rng(20)
+
+    class _SimpleSCM:
+        def simulate(self, n_samples, rng):
+            X = rng.standard_normal((n_samples, 4)).astype(np.float64)
+            y = (X[:, 0] + 0.5 * X[:, 1]).astype(np.float64)
+            return torch.from_numpy(X), torch.from_numpy(y)
+
+    ctx = build_oracle_context(_SimpleSCM(), p=4, n_oracle=256, rng=rng)
+    S = np.array([2])
+    out = delta_vector_for_S_direct_knn(
+        ctx, S, n_folds=5, rng=np.random.default_rng(21)
+    )
+    assert np.isnan(out[2])
+    assert np.all(out[[0, 1, 3]] >= 0.0)
+    # feature 0 should carry the strongest signal on the held-out set
+    assert out[0] > out[1] > out[3]
+
+
+def test_compute_value_queries_accepts_direct_knn_estimator():
+    class _LinearSCM:
+        def simulate(self, n_samples, rng):
+            X = rng.standard_normal((n_samples, 3)).astype(np.float64)
+            y = (X[:, 0] + 0.3 * X[:, 1]).astype(np.float64)
+            return torch.from_numpy(X), torch.from_numpy(y)
+
+    X = torch.zeros(16, 3)
+    y = torch.zeros(16)
+    payload = compute_value_queries(
+        _LinearSCM(), X, y,
+        n_oracle=256,
+        mixture="backup",
+        rng=np.random.default_rng(31),
+        label_estimator="direct_knn",
+        label_knn_folds=5,
+    )
+    assert len(payload["value_queries"]) > 0
+    for q in payload["value_queries"]:
+        assert q.raw_targets is not None
+        raw = q.raw_targets.numpy()
+        S_mask = q.S_mask.numpy()
+        # Nonnegative without clip; NaN exactly where i in S
+        assert np.all(np.isnan(raw[S_mask]))
+        assert np.all(raw[~S_mask] >= 0.0)
+
+
+def test_compute_value_queries_rejects_unknown_estimator():
+    class _SCM:
+        def simulate(self, n_samples, rng):
+            X = rng.standard_normal((n_samples, 2)).astype(np.float64)
+            y = X[:, 0].astype(np.float64)
+            return torch.from_numpy(X), torch.from_numpy(y)
+
+    with pytest.raises(ValueError, match="label_estimator"):
+        compute_value_queries(
+            _SCM(), torch.zeros(4, 2), torch.zeros(4),
+            n_oracle=64,
+            rng=np.random.default_rng(0),
+            label_estimator="not_a_real_one",
+        )

@@ -577,6 +577,9 @@ class SCMPrior(Prior):
                     n_oracle=params.get("label_n_oracle", 512),
                     mixture=params.get("label_mixture", "backup"),
                     mode=mode,
+                    label_estimator=params.get("label_estimator", "histogram"),
+                    label_knn_folds=params.get("label_knn_folds", 5),
+                    label_knn_k=params.get("label_knn_k", None),
                 )
             else:
                 labels = {

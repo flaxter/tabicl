@@ -297,6 +297,150 @@ def delta_value(context: OracleContext, i: int, S: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Cross-fitted direct-Delta estimator (REMEDY.md; replaces histogram plug-in)
+# ---------------------------------------------------------------------------
+
+
+def _direct_delta_cf_knn(
+    X: np.ndarray,
+    y: np.ndarray,
+    S: np.ndarray,
+    p: int,
+    *,
+    n_folds: int = 5,
+    k: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Cross-fitted kNN estimator of the squared conditional-mean gap.
+
+    Estimates the paper's direct identity
+
+        Delta_{i|S} = E[(mu_{S union {i}}(X) - mu_S(X))^2]
+
+    for every candidate feature i in [p] simultaneously, using
+    ``n_folds``-fold cross-fitting of kNN nuisance regressors mu_T. The
+    held-out residual is averaged over all n rows, so each row contributes
+    once to the Monte-Carlo mean. Nonnegative by construction (no clip).
+
+    For |S| = 0 the nuisance mu_S equals the training-fold mean of y; no
+    neighbor search is done. Active coordinates are standardized on the
+    training fold only before the distance calculation.
+
+    Non-finite y rows are dropped before fold assignment. If fewer than
+    ``max(2, n_folds)`` finite rows remain, returns a zero vector with
+    NaN at ``i in S``.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n, p)
+        Oracle-draw features.
+    y : ndarray, shape (n,)
+        Oracle-draw outcomes.
+    S : ndarray of int, shape (|S|,)
+        Conditioning-set indices.
+    p : int
+        Total feature count.
+    n_folds : int, default=5
+        Cross-fitting folds. ``n_folds=n`` emulates leave-one-out.
+    k : int, optional
+        Neighbor count. Defaults to ``ceil(sqrt(n_train))`` (REMEDY v1).
+    rng : np.random.Generator, optional
+        Controls the fold permutation.
+
+    Returns
+    -------
+    ndarray, shape (p,)
+        Delta_{i|S} estimate; NaN at ``i in S``.
+    """
+    from sklearn.neighbors import KNeighborsRegressor
+
+    S = np.asarray(S, dtype=int)
+    S_set = set(int(j) for j in S.tolist())
+    rng = rng if rng is not None else np.random.default_rng()
+
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    X = np.asarray(X, dtype=np.float64)
+    finite = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+    X = X[finite]
+    y = y[finite]
+    n = X.shape[0]
+
+    out = np.full(p, np.nan, dtype=np.float64)
+    if n < max(2, n_folds):
+        for i in range(p):
+            if i not in S_set:
+                out[i] = 0.0
+        return out
+
+    perm = rng.permutation(n)
+    fold_ids = np.empty(n, dtype=np.int64)
+    for f, idx in enumerate(np.array_split(perm, n_folds)):
+        fold_ids[idx] = f
+
+    mu_S_pred = np.empty(n, dtype=np.float64)
+    mu_Si_pred = np.full((n, p), np.nan, dtype=np.float64)
+
+    def _standardize(Xtr: np.ndarray, Xte: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mu = Xtr.mean(axis=0)
+        sd = Xtr.std(axis=0)
+        sd = np.where(sd < 1e-12, 1.0, sd)
+        return (Xtr - mu) / sd, (Xte - mu) / sd
+
+    for f in range(n_folds):
+        te = fold_ids == f
+        tr = ~te
+        n_tr = int(tr.sum())
+        if n_tr < 1:
+            mu_S_pred[te] = 0.0
+            continue
+        Xtr, ytr = X[tr], y[tr]
+        Xte = X[te]
+
+        k_fold = k if k is not None else max(1, int(np.ceil(np.sqrt(n_tr))))
+        k_fold = min(k_fold, n_tr)
+
+        if S.size == 0:
+            mu_S_pred[te] = float(ytr.mean())
+        else:
+            Xtr_S, Xte_S = _standardize(Xtr[:, S], Xte[:, S])
+            knn = KNeighborsRegressor(n_neighbors=k_fold)
+            knn.fit(Xtr_S, ytr)
+            mu_S_pred[te] = knn.predict(Xte_S)
+
+        for i in range(p):
+            if i in S_set:
+                continue
+            feats = np.concatenate([S, np.array([i], dtype=int)])
+            Xtr_Si, Xte_Si = _standardize(Xtr[:, feats], Xte[:, feats])
+            knn = KNeighborsRegressor(n_neighbors=k_fold)
+            knn.fit(Xtr_Si, ytr)
+            mu_Si_pred[te, i] = knn.predict(Xte_Si)
+
+    for i in range(p):
+        if i in S_set:
+            continue
+        diff = mu_Si_pred[:, i] - mu_S_pred
+        out[i] = float(np.mean(diff * diff))
+    return out
+
+
+def delta_vector_for_S_direct_knn(
+    context: OracleContext,
+    S: np.ndarray,
+    *,
+    n_folds: int = 5,
+    k: Optional[int] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """Direct-Delta counterpart to :func:`delta_vector_for_S`."""
+    p = int(context.X.shape[1])
+    return _direct_delta_cf_knn(
+        context.X, context.y, np.asarray(S, dtype=int), p,
+        n_folds=n_folds, k=k, rng=rng,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level label entry point
 # ---------------------------------------------------------------------------
 
@@ -311,6 +455,9 @@ def compute_value_queries(
     mode: Optional[str] = None,
     mixture: str = "default",
     n_bins: int = 10,
+    label_estimator: str = "histogram",
+    label_knn_folds: int = 5,
+    label_knn_k: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute predictive value query labels for one pre-``Reg2Cls`` dataset.
 
@@ -340,6 +487,17 @@ def compute_value_queries(
         Conditioning-state mixture (§7.2 locked default, thinned backup).
     n_bins : int
         Quantile bins per feature for the plug-in estimator.
+    label_estimator : {"histogram", "direct_knn"}
+        Which V(S)/Delta estimator to use. ``"histogram"`` uses the legacy
+        quantile-binning plug-in of ``V(S) = Var(E[Y|X_S])`` and differences
+        it (the original §7.3 path). ``"direct_knn"`` uses the cross-fitted
+        kNN direct estimate of the squared conditional-mean gap
+        (REMEDY.md v1; nonnegative by construction, no max(.,0) clip).
+    label_knn_folds : int
+        Cross-fitting folds for ``label_estimator="direct_knn"``.
+    label_knn_k : int, optional
+        Neighbor count for ``label_estimator="direct_knn"``. Default
+        ``ceil(sqrt(n_train))``.
 
     Returns
     -------
@@ -365,9 +523,22 @@ def compute_value_queries(
     except ValueError:
         return _empty_value_labels(p)
 
+    if label_estimator not in ("histogram", "direct_knn"):
+        raise ValueError(
+            f"label_estimator must be 'histogram' or 'direct_knn'; got {label_estimator!r}"
+        )
+
     queries: List[ValueQuery] = []
     for S, query_type in sample_value_queries_meta(p, rng, mixture=mixture):
-        raw = delta_vector_for_S(context, S)
+        if label_estimator == "histogram":
+            raw = delta_vector_for_S(context, S)
+        else:
+            raw = delta_vector_for_S_direct_knn(
+                context, S,
+                n_folds=label_knn_folds,
+                k=label_knn_k,
+                rng=rng,
+            )
         targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
         S_mask = torch.zeros(p, dtype=torch.bool)
         if S.size > 0:
