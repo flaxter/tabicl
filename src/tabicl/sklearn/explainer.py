@@ -332,10 +332,14 @@ class TabICLExplainer(BaseEstimator):
         # configure() call reads use_amp=False.
         inference_config = getattr(self.base_estimator_, "inference_config_", None)
         if inference_config is not None:
+            # COL/ROW/ICL_CONFIG are MgrConfig dataclasses (see
+            # tabicl/model/inference_config.py::InferenceConfig), not
+            # dicts. Earlier 5b1befc used isinstance(cfg, dict) which
+            # silently skipped. Set attribute directly.
             for attr in ("COL_CONFIG", "ROW_CONFIG", "ICL_CONFIG"):
                 cfg = getattr(inference_config, attr, None)
-                if isinstance(cfg, dict):
-                    cfg["use_amp"] = False
+                if cfg is not None and hasattr(cfg, "use_amp"):
+                    cfg.use_amp = False
         X_t = torch.from_numpy(X_cat).to(self._device, dtype=trunk_dtype)
         y_t = torch.from_numpy(y_train_np[None, ...]).to(self._device, dtype=trunk_dtype)
 
