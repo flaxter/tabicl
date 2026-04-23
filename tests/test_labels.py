@@ -520,6 +520,33 @@ def test_direct_delta_kernel_nonneg_on_nonlinear_signal():
     assert out[0] > out[1] and out[0] > out[2]
 
 
+def test_compute_value_queries_caps_labels_at_y_variance():
+    """Raw Delta estimates must not exceed Var(Y) (theoretical upper bound)."""
+    class _HeavyTailSCM:
+        def simulate(self, n_samples, rng):
+            X = rng.standard_normal((n_samples, 4)).astype(np.float64)
+            # Heavy-tailed Y to trigger finite-sample estimator blow-ups.
+            y = (X[:, 0] ** 5 + 0.1 * rng.standard_normal(n_samples)).astype(np.float64)
+            return torch.from_numpy(X), torch.from_numpy(y)
+
+    payload = compute_value_queries(
+        _HeavyTailSCM(), torch.zeros(8, 4), torch.zeros(8),
+        n_oracle=256,
+        mixture="backup",
+        rng=np.random.default_rng(100),
+        label_estimator="direct_knn",
+    )
+    y_var = payload["y_var_raw"]
+    assert y_var > 0
+    for q in payload["value_queries"]:
+        raw = q.raw_targets.numpy()
+        finite_raw = raw[np.isfinite(raw)]
+        # Every finite raw entry must be at or below y_var plus a tiny epsilon.
+        assert np.all(finite_raw <= y_var + 1e-6), (
+            f"raw max {finite_raw.max()} exceeded y_var {y_var}"
+        )
+
+
 def test_compute_value_queries_accepts_every_direct_estimator():
     class _LinearSCM:
         def simulate(self, n_samples, rng):

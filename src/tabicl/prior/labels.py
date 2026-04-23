@@ -689,6 +689,15 @@ def compute_value_queries(
                 n_folds=label_knn_folds,
                 rng=rng,
             )
+        # Cap raw Delta at Var(Y). Law of total variance gives
+        # Delta_{i|S} = Var(E[Y|X_{S+i}]) - Var(E[Y|X_S]) <= Var(Y) always;
+        # any estimate above y_var is finite-sample noise. Uncapped direct-
+        # Delta estimates have produced 1e10-magnitude outliers on heavy-
+        # tailed draws and destroyed training. The cap is a no-op on
+        # well-behaved draws.
+        if np.isfinite(context.y_var) and context.y_var > 0:
+            cap = float(context.y_var)
+            raw = np.where(np.isfinite(raw), np.minimum(raw, cap), raw)
         targets = np.sqrt(np.clip(raw, a_min=0.0, a_max=None))
         S_mask = torch.zeros(p, dtype=torch.bool)
         if S.size > 0:
