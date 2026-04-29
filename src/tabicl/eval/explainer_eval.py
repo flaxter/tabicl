@@ -215,14 +215,21 @@ def _score_one(suite_name: str, case: EvalCase, explainer: Any, fit_seconds: flo
     necessity_target = _necessity_vector(gt.value_by_state, case.X_train.shape[1])
     necessity_spearman = spearman_per_dataset(explainer.predictive_necessity_, necessity_target)
 
-    path, _ = explainer.greedy_predictive_path()
-    _, acquisition_auc = performance_curve_for_ranking(
-        explainer.base_estimator_,
-        case.X_test,
-        case.y_test,
-        path,
-        task=case.task,
-    )
+    try:
+        path, _ = explainer.greedy_predictive_path()
+        _, acquisition_auc = performance_curve_for_ranking(
+            explainer.base_estimator_,
+            case.X_test,
+            case.y_test,
+            path,
+            task=case.task,
+        )
+    except Exception:
+        # Greedy-acquisition support is optional: if the explainer doesn't
+        # implement greedy_predictive_path (or it crashes on this case), we
+        # still want the other 9 metrics in DatasetScore, so silently set
+        # acquisition_auc=NaN rather than aborting the whole sweep.
+        acquisition_auc = float("nan")
 
     return DatasetScore(
         suite=suite_name,
