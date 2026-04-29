@@ -34,6 +34,7 @@ import numpy as np
 from tabicl import TabICLClassifier
 from tabicl.eval.explainer_eval import EvalCase, build_in_distribution_suite
 from tabicl.eval.metrics import (
+    nanmean as _nanmean,
     pearson_per_dataset,
     spearman_per_dataset,
     topk_recall_per_dataset,
@@ -83,13 +84,6 @@ class S11_2Row:
     spearman_n: float
     pearson_n: float
     mae_n: float
-
-
-def _nanmean(xs) -> float:
-    arr = np.asarray(list(xs), dtype=np.float64)
-    if arr.size == 0 or not np.isfinite(arr).any():
-        return float("nan")
-    return float(np.nanmean(arr))
 
 
 def _pooled_slope_intercept(pairs: Sequence[tuple[float, float]]) -> tuple[float, float]:
