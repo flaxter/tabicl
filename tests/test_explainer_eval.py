@@ -209,6 +209,37 @@ def test_evaluate_explainer_reversed_predictions_negative_sufficiency_spearman()
     assert sc.spearman_sufficiency == pytest.approx(-1.0)
 
 
+def test_evaluate_explainer_acquisition_auc_nan_when_greedy_path_crashes():
+    """Greedy-acquisition support is optional. When ``greedy_predictive_path``
+    raises, ``_score_one`` must still produce all the other metrics for the
+    dataset (Spearman / Pearson / MAE / top-k / sufficiency / necessity) and
+    set ``acquisition_auc=NaN`` rather than aborting the whole sweep.
+
+    Locks down the policy restored in
+    ``explainer_eval: tolerate greedy_predictive_path failures with NaN auc``
+    (PR #4). If a future refactor drops the try/except again, this test
+    fires."""
+    case, _ = _make_case()
+    preds = {k: v.copy() for k, v in case.ground_truth.value_by_state.items()}
+
+    class _NoGreedyExplainer(_DummyExplainer):
+        def greedy_predictive_path(self):
+            raise RuntimeError("no greedy")
+
+    expl = _NoGreedyExplainer(
+        preds, p=4,
+        sufficiency=preds[frozenset()].copy(),
+        necessity=np.array([0.1, 0.2, 0.3, 0.4]),
+    )
+    sc = _evaluate_one(case, expl)
+    # Acquisition AUC is NaN; everything else still scored on perfect preds.
+    assert np.isnan(sc.acquisition_auc)
+    assert sc.spearman_value == pytest.approx(1.0)
+    assert sc.mae_value == pytest.approx(0.0)
+    assert sc.spearman_sufficiency == pytest.approx(1.0)
+    assert sc.spearman_necessity == pytest.approx(1.0)
+
+
 def test_evaluate_explainer_writes_csv(tmp_path: Path):
     case, expl = _make_case()
     suite = EvalSuite(name="unit", cases=[case, case])
