@@ -8,34 +8,18 @@ This repository is a **fork** of `soda-inria/tabicl` maintained by Seth Flaxman 
 
 `soda-inria/tabicl` is the upstream package maintainer. We are not contributing to them. GitHub's default PR target on a fork is the upstream (via its fork-relationship metadata), which has already caused one embarrassing mis-targeted PR. Always pass `--repo flaxter/tabicl` to `gh pr create`, or change the "base repository" dropdown in the GitHub web UI before confirming.
 
-For solo work by Claude agents, prefer skipping PRs entirely on branches you own end-to-end:
+## Branching workflow
 
-```
-# 1. Fetch the feature branch explicitly — `git pull origin main` only
-#    updates main, so origin/claude/<branch> would otherwise be stale or
-#    absent locally and the merge below would silently fail with
-#    "not something we can merge".
-git fetch origin claude/<branch-name> main
+`main` is the only live branch. The post-pivot refactor (conditional predictive value heads, new training loss, eval rewrite) was merged on 2026-04-29.
 
-# 2. Fast-forward main. If this aborts with "Not possible to fast-forward",
-#    main has advanced since the branch was cut — rebase the feature
-#    branch onto origin/main first (git rebase origin/main on the feature
-#    branch, then force-push), then retry.
-git checkout main
-git merge --ff-only origin/main
-git merge --ff-only origin/claude/<branch-name>
+- **Agent-driven fixes** (reviewer findings on l2e clusters that touch tabicl files — e.g., `src/tabicl/prior/labels.py`, `src/tabicl/model/heads.py`, `src/tabicl/train/*`): branch off `main` as `fix/<slug>`, commit, push, open a PR to `main`, ask Seth to merge.
+- **No more long-lived feature branches.** No `refactor/...`, no `claude/<phase>`. Work is small and lands on `main` quickly.
 
-# 3. Push, and ONLY delete the remote branch after the push succeeds.
-#    Chain with `&&` so a failed merge or push short-circuits the delete.
-git push origin main && \
-  git push origin --delete claude/<branch-name>
-```
+**Footgun:** never run `git push origin --delete <branch>` as an unconditional step. If an earlier merge/push failed, the delete still runs and erases the only remote copy of unmerged commits. Always gate cleanup on the push succeeding (`&&`) — or rely on GitHub's auto-delete-source-branch-on-merge setting (currently enabled on this repo).
 
-**Footgun:** never run `git push origin --delete <branch>` as an
-unconditional final step of a merge recipe. If an earlier command failed
-(unknown ref, non-ff, push rejected), the delete still runs and erases
-the only remote copy of unmerged commits. Always gate cleanup on the
-push succeeding (`&&`) or run it as a separate, verified step.
+## Upstream sync deferred
+
+As of 2026-04-29, `flaxter/tabicl:main` is 5 commits behind `soda-inria/tabicl:main`. None are critical bug fixes. Notable: PR #84 ("Clarify public vs. private API") renamed `train/{run,optim,train_config}.py` → underscore-prefixed; this will conflict noisily with our refactor's edits to those files when we eventually re-sync. Defer upstream sync until post-NeurIPS submission.
 
 ## Tooling
 
