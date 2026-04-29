@@ -29,6 +29,19 @@ def _finite_pair_mask(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.isfinite(a) & np.isfinite(b)
 
 
+def nanmean(values) -> float:
+    """Mean of finite entries; NaN if no finite entry exists.
+
+    Used by both ``eval_heads`` and ``explainer_eval`` to aggregate
+    per-state metrics that are NaN on degenerate states (constant
+    predictions, fewer than 3 finite positions, etc.).
+    """
+    arr = np.asarray(list(values), dtype=np.float64)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return float("nan")
+    return float(np.nanmean(arr))
+
+
 def _rank(x: np.ndarray) -> np.ndarray:
     """Average-rank of each entry in ``x`` (ties share the mean rank)."""
     order = np.argsort(x, kind="stable")

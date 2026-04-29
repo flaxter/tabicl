@@ -11,7 +11,12 @@ import numpy as np
 import torch
 
 from tabicl.eval.acquisition import performance_curve_for_ranking
-from tabicl.eval.metrics import pearson_per_dataset, spearman_per_dataset, topk_recall_per_dataset
+from tabicl.eval.metrics import (
+    nanmean as _nanmean,
+    pearson_per_dataset,
+    spearman_per_dataset,
+    topk_recall_per_dataset,
+)
 from tabicl.prior.dataset import Prior
 from tabicl.prior.hp_sampling import HpSamplerList
 from tabicl.prior.labels import build_oracle_context, delta_vector_for_S, sample_value_queries_meta
@@ -261,9 +266,6 @@ def _necessity_vector(value_by_state: Mapping[frozenset[int], np.ndarray], p: in
     return out
 
 
-def _nanmean(values: Sequence[float]) -> float:
-    arr = np.asarray(values, dtype=np.float64)
-    return float(np.nanmean(arr)) if np.isfinite(arr).any() else float("nan")
 
 
 def _sample_prior_type(rng: np.random.Generator, prior_type: str) -> str:
