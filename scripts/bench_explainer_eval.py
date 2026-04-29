@@ -1,226 +1,177 @@
-"""Phase 6a driver — end-to-end attribution-quality benchmark.
+"""CLI driver for the attribution-quality harness.
 
-Runs one or more ``EvalSuite``s through :func:`tabicl.eval.explainer_eval.evaluate_explainer`
-using a ``TabICLExplainer`` factory and writes per-suite CSVs under
-``--out-dir``.
+Builds a suite (in-distribution or held-out-prior), constructs a
+:class:`TabICLExplainer`-based factory from a checkpoint, and runs
+:func:`tabicl.eval.explainer_eval.evaluate_explainer`. Writes a per-dataset
+CSV with every metric in :class:`DatasetScore`.
 
-Two operating modes:
+A ``--smoke`` flag runs a tiny 3-dataset / small-p sweep for arc devel
+partitions.
 
-- ``--heads-checkpoint <path>`` — production: wrap a real Phase 4
-  checkpoint (trunk + heads) and evaluate attribution quality.
-- no checkpoint — smoke / plumbing mode: evaluate **randomly-initialised
-  heads** on a tiny in-memory TabICL. Useful as a CSV-shape regression
-  check and as a baseline Spearman ≈ 0 datum for the paper-run delta.
+Example::
 
-Typical invocation::
-
-    python scripts/bench_explainer_eval.py \
-        --heads-checkpoint /data/.../head_finetune.ckpt \
-        --suites in_distribution,held_out_prior,collider,id_boundary \
-        --n-datasets 50 --seed 0 \
-        --out-dir results/bench_explainer_eval
-
-Smoke::
-
-    python scripts/bench_explainer_eval.py --smoke --out-dir results/smoke
+    uv run python scripts/bench_explainer_eval.py \\
+        --checkpoint path/to/heads.pt \\
+        --suite in_distribution \\
+        --n-datasets 200 \\
+        --num-features 8 \\
+        --out results/bench_explainer_eval.csv
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
-from typing import Callable, List
+from typing import Optional
 
 import numpy as np
-import torch
-
-from tabicl import TabICLExplainer, TabICLRegressor
-from tabicl.eval.explainer_eval import (
-    EvalSuite,
-    build_collider_suite,
-    build_held_out_prior_suite,
-    build_id_boundary_suite,
-    build_in_distribution_suite,
-    evaluate_explainer,
-)
-from tabicl.model.heads import (
-    ConditionalHead,
-    InterventionalHead,
-    ObservationalHead,
-)
-from tabicl.model.tabicl import TabICL
 
 
-SUITE_BUILDERS = {
-    "in_distribution": build_in_distribution_suite,
-    "held_out_prior": build_held_out_prior_suite,
-    "collider": build_collider_suite,
-    "id_boundary": build_id_boundary_suite,
-}
-
-
-def build_smoke_factory() -> Callable[[], TabICLExplainer]:
-    """Factory that builds a tiny in-memory TabICL + fresh random heads.
-
-    Matches the ``tests/test_explainer_eval.py`` pattern so this path
-    requires no pretrained checkpoint and no GPU — suitable for arc
-    devel smokes and CSV-plumbing regression.
-    """
-    EMBED_DIM = 32
-
-    def _make_tiny() -> TabICL:
-        torch.manual_seed(0)
-        return TabICL(
-            max_classes=0,
-            embed_dim=EMBED_DIM,
-            col_num_blocks=2,
-            col_nhead=4,
-            col_num_inds=8,
-            icl_num_blocks=2,
-            icl_nhead=4,
-            row_num_blocks=2,
-            row_nhead=4,
-            row_num_cls=2,
-            ff_factor=2,
-        )
-
-    def _install(estimator):
-        tiny = _make_tiny()
-
-        def _fake_load_model(self=estimator):
-            self.model_path_ = None
-            self.model_ = tiny
-            self.model_config_ = {"max_classes": 0, "embed_dim": EMBED_DIM}
-            self.model_.eval()
-
-        estimator._load_model = _fake_load_model
-
-    def _make():
-        reg = TabICLRegressor(n_estimators=2, random_state=0, verbose=False)
-        _install(reg)
-        torch.manual_seed(0)
-        heads = {
-            "observational": ObservationalHead(embed_dim=EMBED_DIM),
-            "interventional": InterventionalHead(embed_dim=EMBED_DIM),
-            "conditional": ConditionalHead(embed_dim=EMBED_DIM),
-        }
-        return TabICLExplainer(base_estimator=reg, heads=heads)
-
-    return _make
-
-
-def build_production_factory(
-    heads_checkpoint: str | Path,
-    *,
-    n_estimators: int,
-    device: str,
-) -> Callable[[], TabICLExplainer]:
-    """Factory that loads a real Phase 4 checkpoint's heads for each case."""
-    heads_checkpoint = Path(heads_checkpoint)
-
-    def _make():
-        reg = TabICLRegressor(
-            n_estimators=n_estimators, random_state=0, verbose=False,
-            device=device,
-        )
-        return TabICLExplainer(
-            base_estimator=reg,
-            heads_checkpoint_path=heads_checkpoint,
-            device=device,
-        )
-
-    return _make
-
-
-def _resolve_suite(
-    name: str, *, n_datasets: int, seed: int, n_rows: int, n_mc: int, k_cond: int
-) -> EvalSuite:
-    builder = SUITE_BUILDERS[name]
-    if name == "collider":
-        return builder(
-            n_datasets=n_datasets, seed=seed, n_rows=n_rows, k_cond_triples=k_cond,
-        )
-    return builder(
-        n_datasets=n_datasets, seed=seed, n_rows=n_rows,
-        n_mc=n_mc, k_cond_triples=k_cond,
+def _build_suite(args: argparse.Namespace):
+    from tabicl.eval.explainer_eval import (
+        build_held_out_prior_suite,
+        build_in_distribution_suite,
     )
 
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--out-dir", required=True, help="Directory for per-suite CSVs.")
-    p.add_argument(
-        "--suites",
-        default="in_distribution,held_out_prior,collider,id_boundary",
-        help="Comma-separated subset of: " + ", ".join(SUITE_BUILDERS.keys()),
+    # The builders take min/max_features (range) and n_rows; the CLI takes
+    # a single num_features and seq_len. Pin both to num_features so each
+    # dataset in the suite has exactly p=num_features columns.
+    builder_kwargs = dict(
+        n_datasets=args.n_datasets,
+        seed=args.seed,
+        n_rows=args.seq_len,
+        min_features=args.num_features,
+        max_features=args.num_features,
+        n_oracle=args.n_oracle,
+        mixture=args.mixture,
     )
-    p.add_argument("--n-datasets", type=int, default=50)
-    p.add_argument("--n-rows", type=int, default=500)
-    p.add_argument("--n-mc", type=int, default=512)
-    p.add_argument("--k-cond-triples", type=int, default=8)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument(
-        "--heads-checkpoint", default=None,
-        help="Path to Phase 4 checkpoint with trunk + head state dicts. "
-             "If omitted, runs the tiny-TabICL smoke factory.",
-    )
-    p.add_argument("--n-estimators", type=int, default=4)
-    p.add_argument("--device", default="cpu")
-    p.add_argument("--verbose", action="store_true")
-    p.add_argument(
-        "--smoke", action="store_true",
-        help="Tiny-plumbing defaults: n_datasets=2, n_rows=64, 1 suite.",
-    )
-    return p
+    if args.suite == "in_distribution":
+        return build_in_distribution_suite(**builder_kwargs)
+    if args.suite == "held_out_prior":
+        return build_held_out_prior_suite(**builder_kwargs)
+    raise ValueError(f"Unknown suite {args.suite!r}")
 
 
-def main(argv: List[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _build_factory(args: argparse.Namespace):
+    """Return a ``(X, y) -> TabICLExplainer`` factory."""
+    from tabicl import TabICLClassifier, TabICLRegressor
+    from tabicl.sklearn.explainer import TabICLExplainer
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.smoke:
-        n_datasets = 2
-        n_rows = 64
-        n_mc = 32
-        k_cond = 3
-        suites = ["in_distribution", "collider"]
-    else:
-        n_datasets = args.n_datasets
-        n_rows = args.n_rows
-        n_mc = args.n_mc
-        k_cond = args.k_cond_triples
-        suites = [s.strip() for s in args.suites.split(",") if s.strip()]
-
-    unknown = [s for s in suites if s not in SUITE_BUILDERS]
-    if unknown:
-        raise SystemExit(f"Unknown suite(s): {unknown}. Known: {list(SUITE_BUILDERS)}")
-
-    if args.heads_checkpoint:
-        factory = build_production_factory(
-            args.heads_checkpoint,
-            n_estimators=args.n_estimators,
+    def factory(X: np.ndarray, y: np.ndarray):
+        is_classification = np.issubdtype(np.asarray(y).dtype, np.integer) or (
+            np.unique(y).size <= 10 and np.all(np.mod(np.asarray(y, dtype=float), 1) == 0)
+        )
+        base = (
+            TabICLClassifier(device=args.device)
+            if is_classification
+            else TabICLRegressor(device=args.device)
+        )
+        expl = TabICLExplainer(
+            base_estimator=base,
+            heads_checkpoint_path=args.checkpoint,
             device=args.device,
         )
-        mode_tag = "prod"
-    else:
-        factory = build_smoke_factory()
-        mode_tag = "smoke"
+        return expl.fit(X, y)
 
-    for suite_name in suites:
-        print(f"[{mode_tag}] Building suite '{suite_name}' (n={n_datasets}, rows={n_rows})")
-        suite = _resolve_suite(
-            suite_name, n_datasets=n_datasets, seed=args.seed,
-            n_rows=n_rows, n_mc=n_mc, k_cond=k_cond,
+    return factory
+
+
+def _smoke_args_override(args: argparse.Namespace) -> argparse.Namespace:
+    """Tiny-suite knobs for ``--smoke`` (arc devel partition)."""
+    args.n_datasets = 3
+    args.num_features = 4
+    args.seq_len = 200
+    args.n_oracle = 400
+    return args
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--checkpoint", required=True,
+        help="Path to a training checkpoint with the value-head state dict.",
+    )
+    parser.add_argument(
+        "--suite", default="in_distribution",
+        choices=("in_distribution", "held_out_prior"),
+    )
+    parser.add_argument("--n-datasets", type=int, default=200)
+    parser.add_argument("--num-features", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=500)
+    parser.add_argument("--n-oracle", type=int, default=2000)
+    parser.add_argument("--n-bins", type=int, default=10,
+                        help="Unused by the suite builders; kept for CLI "
+                        "back-compat with earlier bench scripts.")
+    parser.add_argument(
+        "--mixture", default="backup",
+        help="Prior mixture for synthetic cases (default matches preregistration §11).",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--device", default="cpu",
+        help="Device for the TabICL base estimators and explainer.",
+    )
+    parser.add_argument(
+        "--out", default="results/bench_explainer_eval.csv",
+        help="Output CSV path (will be created).",
+    )
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="Tiny sweep for arc devel: 3 datasets / p=4 / seq_len=200.",
+    )
+    args = parser.parse_args(argv)
+    if args.smoke:
+        args = _smoke_args_override(args)
+
+    if not Path(args.checkpoint).exists():
+        print(f"[bench_explainer_eval] checkpoint not found: {args.checkpoint}", file=sys.stderr)
+        return 2
+
+    from tabicl.eval.explainer_eval import evaluate_explainer
+
+    t0 = time.time()
+    suite = _build_suite(args)
+    t_suite = time.time() - t0
+    n_cases = len(suite.cases)
+    print(
+        f"[bench_explainer_eval] built {args.suite} suite of {n_cases} datasets "
+        f"in {t_suite:.1f}s",
+        flush=True,
+    )
+
+    factory = _build_factory(args)
+    t1 = time.time()
+    scores = evaluate_explainer(factory, suite, out_csv=args.out)
+    t_eval = time.time() - t1
+    print(
+        f"[bench_explainer_eval] scored {len(scores)} datasets in {t_eval:.1f}s "
+        f"-> {args.out}",
+        flush=True,
+    )
+
+    # Terse summary for stdout / SLURM log grep.
+    def _nanmean(attr: str) -> float:
+        xs = np.array([getattr(s, attr) for s in scores], dtype=np.float64)
+        if not np.isfinite(xs).any():
+            return float("nan")
+        return float(np.nanmean(xs))
+
+    print(
+        "  spearman_value={:.3f}  pearson_value={:.3f}  mae={:.3f}  "
+        "top1={:.3f}  top3={:.3f}  suff={:.3f}  nec={:.3f}  auc={:.3f}".format(
+            _nanmean("spearman_value"),
+            _nanmean("pearson_value"),
+            _nanmean("mae_value"),
+            _nanmean("top1_next_feature"),
+            _nanmean("top3_next_feature"),
+            _nanmean("spearman_sufficiency"),
+            _nanmean("spearman_necessity"),
+            _nanmean("acquisition_auc"),
         )
-        out_csv = out_dir / f"{suite_name}.csv"
-        print(f"[{mode_tag}] Evaluating → {out_csv}")
-        evaluate_explainer(factory, suite, out_csv=out_csv, verbose=args.verbose)
-
-    print(f"Done. Wrote {len(suites)} CSV(s) under {out_dir}.")
+    )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

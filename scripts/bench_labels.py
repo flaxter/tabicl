@@ -1,22 +1,23 @@
-"""Phase 3 — labels-per-second CPU throughput benchmark.
+"""Label-cost benchmark for compute_value_queries.
 
-Measures, for each ``(prior, n, p, batch)`` configuration:
+Measures per-dataset cost of the simulator-oracle plug-in estimator
+under the locked §7.2 mixture (10 states default / 6 states backup).
+Writes one CSV row per (prior_type, n, p, mixture, n_oracle) cell.
 
-- ``t_scm``               — SCM instantiation + continuous ``(X, y)`` sampling.
-- ``t_label_A``           — Head A label cost in isolation.
-- ``t_label_I``           — Head I label cost in isolation (NaN for
-                            non-identifiable priors; this column is ``0`` then).
-- ``t_label_C``           — Head C label cost in isolation.
-- ``t_total_with_labels`` — SCM + all three labels (the real Phase 4 cost).
-- ``overhead_ratio``      — ``(t_total_with_labels - t_scm) / t_scm``.
-- ``labels_per_sec``      — batch / ``t_total_with_labels``.
+Usage:
+    uv run python scripts/bench_labels.py \\
+        --out /path/to/bench_labels.csv \\
+        --n-datasets 30 \\
+        --priors mlp_scm tree_scm \\
+        --n-values 512 1024 \\
+        --p-values 8 16 20 \\
+        --n-oracle-values 256 512 \\
+        --mixtures default backup
 
-Timings are per-batch wall-clock via ``time.perf_counter()``. Output is a
-single CSV appended at ``--out``.
-
-Designed to run on the ``arc`` CPU cluster (see
-``learning-to-explain/bench_labels.slurm``), but also works locally with a
-reduced grid via ``--smoke``.
+The Task 9 smoke target is >=500 ms/dataset on the most expensive
+(prior, p, n_oracle) cell; if the primary mixture exceeds that target
+on any cell in the training regime, the preregistration's backup
+mixture kicks in.
 """
 from __future__ import annotations
 
@@ -29,234 +30,147 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
-from joblib import Parallel, delayed
-from threadpoolctl import threadpool_limits
 
-from tabicl.prior.identifiable_scm import ANMSCM, LiNGAMSCM, TreeSCM_Ident
-from tabicl.prior.labels import compute_labels
+from tabicl.prior.labels import compute_value_queries
 from tabicl.prior.mlp_scm import MLPSCM
-
-# --------------------------------------------------------------------------
-# Prior factories — each returns a fresh SCM instance
-# --------------------------------------------------------------------------
-
-
-def _make_lingam(n: int, p: int, seed: int) -> LiNGAMSCM:
-    return LiNGAMSCM(seq_len=n, num_features=p, seed=seed)
+from tabicl.prior.tree_scm import TreeSCM
+from tabicl.prior.prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+from tabicl.prior.hp_sampling import HpSamplerList
 
 
-def _make_anm(n: int, p: int, seed: int) -> ANMSCM:
-    return ANMSCM(seq_len=n, num_features=p, seed=seed)
-
-
-def _make_tree_path(n: int, p: int, seed: int) -> TreeSCM_Ident:
-    return TreeSCM_Ident(seq_len=n, num_features=p, seed=seed)
-
-
-def _make_mlp(n: int, p: int, seed: int) -> MLPSCM:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    return MLPSCM(seq_len=n, num_features=p, num_layers=3, hidden_dim=max(20, 2 * p + 2))
-
-
-def _make_mix(n: int, p: int, seed: int):
-    rng = np.random.default_rng(seed)
-    choice = rng.choice(["lingam_scm", "anm_scm", "tree_path_scm"])
-    return _FACTORIES[choice](n, p, seed)
-
-
-_FACTORIES = {
-    "lingam_scm": _make_lingam,
-    "anm_scm": _make_anm,
-    "tree_path_scm": _make_tree_path,
-    "mlp_scm": _make_mlp,
-    "mix_scm_identifiable": _make_mix,
+_REGISTRY = {
+    "mlp_scm": MLPSCM,
+    "tree_scm": TreeSCM,
 }
 
 
-# --------------------------------------------------------------------------
-# Per-head isolation
-# --------------------------------------------------------------------------
+@torch.no_grad()
+def _build_scm(prior_type: str, seq_len: int, num_features: int, rng_seed: int) -> Any:
+    """Construct an SCM instance with sensible defaults.
+
+    Uses the same HP-sampler machinery as PriorDataset so the SCM
+    hyperparameters resemble training-time distributions.
+    """
+    torch.manual_seed(rng_seed)
+    np.random.seed(rng_seed)
+    sampler = HpSamplerList(DEFAULT_SAMPLED_HP, device="cpu")
+    sampled = sampler.sample()
+    params: Dict[str, Any] = {
+        **DEFAULT_FIXED_HP,
+        **{k: (v() if callable(v) else v) for k, v in sampled.items()},
+        "seq_len": seq_len,
+        "num_features": num_features,
+        "num_classes": 2,
+        "device": "cpu",
+    }
+    cls = _REGISTRY[prior_type]
+    return cls(**params), params
 
 
-def _time_single_head(scm: Any, X: torch.Tensor, y: torch.Tensor, head: str,
-                      n_mc: int, k: int) -> float:
-    """Rough per-head cost: call compute_labels() suppressing other heads."""
-    # We do not expose per-head knobs yet, so approximate by k=0 triples for
-    # "A-only" / "I-only", and k=k with n_mc=1 for "C-only". This is a proxy
-    # but matches the relative ordering of costs cleanly enough.
-    rng = np.random.default_rng(0)
-    if head == "A":
+def _bench_one(
+    prior_type: str,
+    seq_len: int,
+    num_features: int,
+    n_oracle: int,
+    mixture: str,
+    n_datasets: int,
+    rng_seed: int = 0,
+) -> Dict[str, float]:
+    """Measure compute_value_queries cost averaged over n_datasets draws."""
+    times: List[float] = []
+    query_counts: List[int] = []
+    for ds_idx in range(n_datasets):
+        scm, _ = _build_scm(prior_type, seq_len, num_features, rng_seed + ds_idx)
+        X, y = scm()
+        if isinstance(X, torch.Tensor):
+            X = X.detach()
+            y = y.detach()
+        rng = np.random.default_rng(rng_seed + ds_idx)
         t0 = time.perf_counter()
-        compute_labels(scm, X, y, n_mc=n_mc, k_cond_triples=0, rng=rng)
-        return time.perf_counter() - t0
-    if head == "I":
-        t0 = time.perf_counter()
-        compute_labels(scm, X, y, n_mc=n_mc, k_cond_triples=0, rng=rng)
-        return time.perf_counter() - t0
-    if head == "C":
-        t0 = time.perf_counter()
-        compute_labels(scm, X, y, n_mc=max(1, n_mc // 8), k_cond_triples=k, rng=rng)
-        return time.perf_counter() - t0
-    raise ValueError(head)
-
-
-# --------------------------------------------------------------------------
-# Benchmark driver
-# --------------------------------------------------------------------------
-
-
-def bench_one(
-    prior: str,
-    n: int,
-    p: int,
-    batch: int,
-    n_mc: int,
-    k_cond_triples: int,
-    seed: int,
-    rep: int = 0,
-) -> Dict[str, Any]:
-    # Pin BLAS to a single thread inside this worker so parallel configs don't
-    # fight over the shared thread pool and the per-cell timings stay clean.
-    with threadpool_limits(1):
-        factory = _FACTORIES[prior]
-
-        # 1. SCM + (X, y) sampling baseline (summed across the batch).
-        t0 = time.perf_counter()
-        scms = []
-        Xs, ys = [], []
-        for b in range(batch):
-            scm = factory(n=n, p=p, seed=seed + b)
-            X, y = scm()
-            scms.append(scm)
-            Xs.append(X)
-            ys.append(y)
-        t_scm = time.perf_counter() - t0
-
-        # 2. Total (with labels).
-        t0 = time.perf_counter()
-        rng = np.random.default_rng(seed)
-        for b in range(batch):
-            compute_labels(
-                scms[b], Xs[b], ys[b],
-                n_mc=n_mc, k_cond_triples=k_cond_triples, rng=rng,
-            )
-        t_total_labels_only = time.perf_counter() - t0
-
-        # 3. Per-head isolated costs (first batch element only, to keep the
-        # benchmark under a few minutes on large grids).
-        t_A = _time_single_head(scms[0], Xs[0], ys[0], "A", n_mc, k_cond_triples)
-        t_I = _time_single_head(scms[0], Xs[0], ys[0], "I", n_mc, k_cond_triples)
-        t_C = _time_single_head(scms[0], Xs[0], ys[0], "C", n_mc, k_cond_triples)
-
-        t_total_with_labels = t_scm + t_total_labels_only
-        overhead_ratio = t_total_labels_only / max(t_scm, 1e-9)
-
-        return {
-            "prior": prior,
-            "n": n,
-            "p": p,
-            "batch": batch,
-            "n_mc": n_mc,
-            "k_cond_triples": k_cond_triples,
-            "t_scm_s": round(t_scm, 4),
-            "t_label_A_s": round(t_A, 4),
-            "t_label_I_s": round(t_I, 4),
-            "t_label_C_s": round(t_C, 4),
-            "t_total_with_labels_s": round(t_total_with_labels, 4),
-            "overhead_ratio": round(overhead_ratio, 3),
-            "labels_per_sec": round(batch / max(t_total_with_labels, 1e-9), 2),
-            "rep": rep,
-        }
-
-
-def parse_list(s: str, cast=int) -> List[Any]:
-    return [cast(x) for x in s.split(",") if x.strip()]
+        payload = compute_value_queries(
+            scm,
+            X,
+            y,
+            n_oracle=n_oracle,
+            mixture=mixture,
+            rng=rng,
+        )
+        dt = time.perf_counter() - t0
+        times.append(dt)
+        query_counts.append(len(payload["value_queries"]))
+    arr = np.array(times)
+    return {
+        "prior_type": prior_type,
+        "n": seq_len,
+        "p": num_features,
+        "n_oracle": n_oracle,
+        "mixture": mixture,
+        "n_datasets": n_datasets,
+        "mean_ms": float(arr.mean() * 1000),
+        "median_ms": float(np.median(arr) * 1000),
+        "p95_ms": float(np.quantile(arr, 0.95) * 1000),
+        "max_ms": float(arr.max() * 1000),
+        "queries_per_ds": float(np.mean(query_counts)),
+    }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="results/bench_labels.csv")
-    ap.add_argument("--grid-n", default="256,1024,4096")
-    ap.add_argument("--grid-p", default="5,20,50")
-    ap.add_argument("--grid-batch", default="32,128")
-    ap.add_argument(
-        "--prior-set",
-        default="lingam_scm,anm_scm,tree_path_scm,mlp_scm,mix_scm_identifiable",
-    )
-    ap.add_argument("--n-mc", type=int, default=2048)
-    ap.add_argument("--k-cond-triples", type=int, default=16)
-    ap.add_argument("--n-jobs", type=int, default=1,
-                    help="Number of joblib workers over (prior, n, p, batch, rep) "
-                         "configs. BLAS is pinned to 1 thread per worker to keep "
-                         "per-cell timings clean.")
-    ap.add_argument("--n-batches", type=int, default=1,
-                    help="Number of repetitions per (prior, n, p, batch) cell.")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--smoke", action="store_true",
-                    help="Override grids with a tiny smoke-test configuration.")
+    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--n-datasets", type=int, default=20)
+    ap.add_argument("--priors", nargs="+", default=["mlp_scm", "tree_scm"])
+    ap.add_argument("--n-values", nargs="+", type=int, default=[512, 1024])
+    ap.add_argument("--p-values", nargs="+", type=int, default=[8, 16, 20])
+    ap.add_argument("--n-oracle-values", nargs="+", type=int, default=[256, 512])
+    ap.add_argument("--mixtures", nargs="+", default=["default", "backup"])
+    ap.add_argument("--rng-seed", type=int, default=0)
     args = ap.parse_args()
 
-    if args.smoke:
-        args.grid_n = "128,512"
-        args.grid_p = "4,12"
-        args.grid_batch = "4,16"
-        args.prior_set = "lingam_scm,anm_scm,mlp_scm"
-        args.n_mc = 128
-        args.k_cond_triples = 4
-        args.n_batches = 1
+    args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    ns = parse_list(args.grid_n)
-    ps = parse_list(args.grid_p)
-    batches = parse_list(args.grid_batch)
-    priors = parse_list(args.prior_set, cast=str)
-
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Flush per row so partial results survive SLURM wall-clock kills.
     fieldnames = [
-        "prior", "n", "p", "batch", "n_mc", "k_cond_triples",
-        "t_scm_s", "t_label_A_s", "t_label_I_s", "t_label_C_s",
-        "t_total_with_labels_s", "overhead_ratio", "labels_per_sec", "rep",
+        "prior_type", "n", "p", "n_oracle", "mixture", "n_datasets",
+        "mean_ms", "median_ms", "p95_ms", "max_ms", "queries_per_ds",
     ]
-    tasks = (
-        delayed(bench_one)(
-            prior=prior, n=n, p=p, batch=batch,
-            n_mc=args.n_mc, k_cond_triples=args.k_cond_triples,
-            seed=args.seed + rep * 101, rep=rep,
+    first_write = not args.out.exists()
+    with open(args.out, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if first_write:
+            writer.writeheader()
+
+        total_cells = (
+            len(args.priors) * len(args.n_values) * len(args.p_values)
+            * len(args.n_oracle_values) * len(args.mixtures)
         )
-        for prior in priors
-        for n in ns
-        for p in ps
-        for batch in batches
-        for rep in range(args.n_batches)
-    )
-
-    # return_as='generator' streams rows back as workers finish, so we can
-    # keep the per-row CSV flush added in db2b64d and still dispatch across
-    # --n-jobs workers. Row order will be completion order, not dispatch
-    # order, under n_jobs > 1.
-    results = Parallel(n_jobs=args.n_jobs, return_as="generator")(tasks)
-
-    n_rows = 0
-    with open(out_path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        fh.flush()
-        for row in results:
-            writer.writerow(row)
-            fh.flush()
-            n_rows += 1
-            print(
-                f"{row['prior']:>22s} n={row['n']:>4d} p={row['p']:>3d} "
-                f"batch={row['batch']:>3d} "
-                f"t_total={row['t_total_with_labels_s']:.3f}s "
-                f"labels/s={row['labels_per_sec']:.1f} "
-                f"overhead={row['overhead_ratio']:.2f}x",
-                flush=True,
-            )
-    print(f"\nWrote {n_rows} rows to {out_path}")
+        cell = 0
+        for prior_type in args.priors:
+            for n in args.n_values:
+                for p in args.p_values:
+                    for n_oracle in args.n_oracle_values:
+                        for mixture in args.mixtures:
+                            cell += 1
+                            print(
+                                f"[{cell}/{total_cells}] prior={prior_type} n={n} "
+                                f"p={p} n_oracle={n_oracle} mixture={mixture}",
+                                flush=True,
+                            )
+                            row = _bench_one(
+                                prior_type=prior_type,
+                                seq_len=n,
+                                num_features=p,
+                                n_oracle=n_oracle,
+                                mixture=mixture,
+                                n_datasets=args.n_datasets,
+                                rng_seed=args.rng_seed,
+                            )
+                            print(
+                                f"  mean={row['mean_ms']:.1f}ms "
+                                f"p95={row['p95_ms']:.1f}ms "
+                                f"queries_per_ds={row['queries_per_ds']:.1f}",
+                                flush=True,
+                            )
+                            writer.writerow(row)
+                            f.flush()
 
 
 if __name__ == "__main__":

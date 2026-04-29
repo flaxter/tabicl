@@ -1,117 +1,141 @@
-"""Phase 6e — end-to-end smoke for the eval_heads CLI.
+"""Unit tests for :mod:`tabicl.eval.eval_heads`.
 
-Builds a tiny TabICL trunk + three freshly-initialised heads, saves a
-checkpoint in the format the Phase 5-extended ``Trainer.save_checkpoint``
-writes, runs the eval script on a 2-batch LiNGAM-only stream, and
-checks the output CSV has the expected columns plus a trailing ``mean``
-row.
+Covers:
 
-The metrics produced here are not meaningful (untrained heads), but the
-pipeline is — the test exercises:
+- ``classify_stratum`` bucketing rules.
+- ``score_by_stratum`` returns finite metrics for every populated stratum
+  when predictions are perfect, and NaN for strata with no states.
+- ``evaluate_head_by_stratum`` writes one row per (dataset, stratum) pair.
 
-- Checkpoint round-trip (``load_checkpoint`` + fresh ``state_dict``).
-- End-to-end forward through the trunk with ``return_column_embeddings``.
-- Per-batch metric computation including Head C per-triple evaluation.
-- CSV writer's trailing-mean aggregation.
+Head-only fine-tuning (``fit_head_only``) is covered implicitly by the
+training smoke: we only verify the API shape here without running a
+trunk forward pass.
 """
 from __future__ import annotations
 
 import csv
 from pathlib import Path
+from typing import Mapping, Sequence
 
 import numpy as np
 import pytest
-import torch
 
-from tabicl.eval.eval_heads import main as eval_main
-from tabicl.model.heads import (
-    ConditionalHead,
-    InterventionalHead,
-    ObservationalHead,
+from tabicl.eval.eval_heads import (
+    STRATA,
+    StratumMetrics,
+    classify_stratum,
+    evaluate_head_by_stratum,
+    score_by_stratum,
 )
-from tabicl.model.tabicl import TabICL
+from tabicl.eval.explainer_eval import DatasetSpec, GroundTruth
 
 
-EMBED_DIM = 32
+# ---------------------------------------------------------------------------
+# classify_stratum
+# ---------------------------------------------------------------------------
 
 
-def _build_tiny_checkpoint(path: Path) -> None:
-    torch.manual_seed(0)
-    trunk_config = {
-        "max_classes": 10,
-        "embed_dim": EMBED_DIM,
-        "col_num_blocks": 2,
-        "col_nhead": 4,
-        "col_num_inds": 8,
-        "col_feature_group": False,
-        "icl_num_blocks": 2,
-        "icl_nhead": 4,
-        "row_num_blocks": 2,
-        "row_nhead": 4,
-        "row_num_cls": 2,
-        "ff_factor": 2,
-    }
-    trunk = TabICL(**trunk_config)
-    head_a = ObservationalHead(embed_dim=EMBED_DIM)
-    head_i = InterventionalHead(embed_dim=EMBED_DIM)
-    head_c = ConditionalHead(embed_dim=EMBED_DIM)
-
-    checkpoint = {
-        "config": trunk_config,
-        "state_dict": trunk.state_dict(),
-        "heads": {
-            "observational": head_a.state_dict(),
-            "interventional": head_i.state_dict(),
-            "conditional": head_c.state_dict(),
-            "config": {"embed_dim": EMBED_DIM, "hidden_dim": None},
-        },
-    }
-    torch.save(checkpoint, path)
+def test_classify_stratum_named_buckets():
+    p = 10
+    assert classify_stratum(p, frozenset()) == "empty"
+    assert classify_stratum(p, frozenset([2])) == "singleton"
+    assert classify_stratum(p, frozenset([0, 1, 2])) == "small"
+    assert classify_stratum(p, frozenset(range(p - 1))) == "near_full"
+    assert classify_stratum(p, frozenset(range(p - 2))) == "near_full"
+    # Medium bucket includes p//2 exactly.
+    assert classify_stratum(p, frozenset(range(p // 2))) == "medium"
 
 
-def test_eval_heads_end_to_end(tmp_path: Path):
-    ckpt = tmp_path / "phase6e_smoke.ckpt"
-    out_csv = tmp_path / "heads_eval.csv"
-    _build_tiny_checkpoint(ckpt)
+def test_classify_stratum_small_p():
+    # p = 3: singleton → 1, near_full → {1, 2} → hits 'near_full' branch via p-2/p-1.
+    assert classify_stratum(3, frozenset([0])) == "singleton"
+    assert classify_stratum(3, frozenset([0, 1])) == "near_full"
 
-    rc = eval_main(
-        [
-            "--checkpoint_path", str(ckpt),
-            "--out", str(out_csv),
-            "--n_batches", "2",
-            "--batch_size", "4",
-            "--batch_size_per_gp", "2",
-            "--min_features", "4",
-            "--max_features", "6",
-            "--min_seq_len", "64",
-            "--max_seq_len", "128",
-            "--prior_type", "lingam_scm",
-            "--seed", "0",
-            "--device", "cpu",
-        ]
+
+# ---------------------------------------------------------------------------
+# score_by_stratum: dummy explainer
+# ---------------------------------------------------------------------------
+
+
+class _DummyExplainer:
+    def __init__(self, preds_by_state: Mapping):
+        self._preds = {frozenset(k): np.asarray(v, dtype=np.float64) for k, v in preds_by_state.items()}
+
+    def conditional_predictive_values(self, S: Sequence[int]) -> np.ndarray:
+        return self._preds[frozenset(int(i) for i in S)].copy()
+
+
+def _make_spec(p: int = 6) -> tuple[DatasetSpec, _DummyExplainer]:
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((30, p))
+    y = rng.standard_normal(30)
+
+    value_by_state = {}
+    empty = frozenset()
+    value_by_state[empty] = np.array([0.9, 0.2, 0.7, 0.3, 0.1, 0.5])
+
+    # Populate at least one state in every stratum.
+    value_by_state[frozenset([0])] = np.array([np.nan, 0.4, 0.5, 0.1, 0.2, 0.1])
+    value_by_state[frozenset([0, 1, 2])] = np.array([np.nan, np.nan, np.nan, 0.4, 0.3, 0.5])
+    value_by_state[frozenset([0, 1, 2, 3])] = np.array([np.nan, np.nan, np.nan, np.nan, 0.2, 0.8])   # |S|=p//2=3 or 4
+    value_by_state[frozenset([0, 1, 2, 3, 4])] = np.array([np.nan]*5 + [0.9])  # p-1 near_full
+
+    gt = GroundTruth(value_by_state=value_by_state, y_var=1.0)
+    preds = {k: v.copy() for k, v in value_by_state.items()}
+    return (
+        DatasetSpec(name="d0", X=X, y=y, ground_truth=gt, meta={}),
+        _DummyExplainer(preds),
     )
-    assert rc == 0
-    assert out_csv.exists()
-
-    with open(out_csv) as f:
-        rows = list(csv.DictReader(f))
-
-    # Two per-batch rows plus the trailing mean row.
-    assert len(rows) == 3
-    assert rows[-1]["batch"] == "mean"
-    # Expected columns exist.
-    for col in ("spearman_A", "pearson_A", "top1_A", "mse_C", "mae_C", "frac_identifiable"):
-        assert col in rows[0], f"missing column {col}"
-
-    # The LiNGAM-only prior has is_identifiable=True for every sample.
-    assert float(rows[0]["frac_identifiable"]) == pytest.approx(1.0)
 
 
-def test_eval_heads_rejects_checkpoint_without_heads(tmp_path: Path):
-    from tabicl.eval.eval_heads import load_checkpoint
+def test_score_by_stratum_perfect_predictions_populated_buckets():
+    spec, expl = _make_spec()
+    out = score_by_stratum(expl, spec)
+    assert set(out.keys()) == set(STRATA)
 
-    bad_ckpt = tmp_path / "no_heads.ckpt"
-    torch.save({"config": {"embed_dim": EMBED_DIM}, "state_dict": {}}, bad_ckpt)
+    # Empty + singleton + small + near_full always populated; medium may be.
+    for bucket in ("empty", "singleton", "near_full"):
+        m = out[bucket]
+        assert m.n_states >= 1
+        # Perfect predictions → MAE/MSE 0 for every bucket that has enough
+        # finite overlap for Spearman; MAE is always finite.
+        assert m.mae == pytest.approx(0.0, abs=1e-9)
+        assert m.mse == pytest.approx(0.0, abs=1e-9)
 
-    with pytest.raises(KeyError, match="heads"):
-        load_checkpoint(bad_ckpt, device="cpu")
+
+def test_score_by_stratum_fills_unused_bucket_with_nan():
+    """Remove every empty-set query → stratum has zero states."""
+    spec, expl = _make_spec()
+    # Build a spec with no empty state.
+    states = {k: v for k, v in spec.ground_truth.value_by_state.items() if len(k) > 0}
+    spec2 = DatasetSpec(
+        name=spec.name, X=spec.X, y=spec.y,
+        ground_truth=GroundTruth(value_by_state=states),
+        meta={},
+    )
+    expl2 = _DummyExplainer({k: v.copy() for k, v in states.items()})
+    out = score_by_stratum(expl2, spec2)
+    assert out["empty"].n_states == 0
+    assert np.isnan(out["empty"].mae)
+    assert np.isnan(out["empty"].spearman)
+
+
+def test_evaluate_head_by_stratum_writes_csv_with_one_row_per_bucket(tmp_path: Path):
+    spec, expl = _make_spec()
+    out = tmp_path / "head_eval.csv"
+
+    def factory(X, y):
+        return expl
+
+    rows = evaluate_head_by_stratum(factory, [spec, spec], out_csv=out)
+    assert len(rows) == len(STRATA) * 2
+    assert isinstance(rows[0], StratumMetrics)
+    assert out.exists()
+
+    with out.open() as f:
+        csv_rows = list(csv.DictReader(f))
+    assert len(csv_rows) == len(STRATA) * 2
+    # Every bucket appears twice (once per dataset).
+    stratums = [r["stratum"] for r in csv_rows]
+    for s in STRATA:
+        assert stratums.count(s) == 2

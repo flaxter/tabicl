@@ -33,8 +33,7 @@ from torch.utils.data import IterableDataset
 
 from .mlp_scm import MLPSCM
 from .tree_scm import TreeSCM
-from .identifiable_scm import LiNGAMSCM, ANMSCM, TreeSCM_Ident
-from .labels import compute_labels
+from .labels import compute_value_queries
 
 from .hp_sampling import HpSamplerList
 from .reg2cls import Reg2Cls
@@ -46,13 +45,7 @@ from .prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
 _PRIOR_REGISTRY: Dict[str, type] = {
     "mlp_scm": MLPSCM,
     "tree_scm": TreeSCM,
-    "lingam_scm": LiNGAMSCM,
-    "anm_scm": ANMSCM,
-    "tree_path_scm": TreeSCM_Ident,
 }
-
-# Priors that emit labels with is_identifiable=True by construction.
-_IDENTIFIABLE_PRIORS = {"lingam_scm", "anm_scm", "tree_path_scm"}
 
 
 warnings.filterwarnings(
@@ -558,10 +551,9 @@ class SCMPrior(Prior):
             Number of active features after filtering (scalar Tensor).
 
         labels : dict
-            Phase 3 attribution labels: ``{"o_star", "i_star", "c_triples",
-            "is_identifiable"}``. Computed on the continuous pre-``Reg2Cls``
-            outcome; Phase 4's training loss must account for the scale
-            mismatch with the discretised class labels returned in ``y``.
+            Conditional predictive value labels: ``{"value_queries",
+            "y_var_raw", "label_scale"}``. Computed on the continuous
+            pre-``Reg2Cls`` outcome.
         """
 
         prior_type = params["prior_type"]
@@ -573,26 +565,27 @@ class SCMPrior(Prior):
             scm = prior_cls(**params)
             X_raw, y_raw = scm()
 
-            # Phase 3: labels are computed on the continuous pre-Reg2Cls (X, y).
+            # Labels computed on the continuous pre-Reg2Cls (X, y).
             if params.get("label_compute", True):
                 mode_map = params.get("label_mode_per_prior", {})
                 mode = mode_map.get(prior_type)
-                labels = compute_labels(
+                labels = compute_value_queries(
                     scm,
                     X_raw,
                     y_raw,
                     params=params,
-                    n_mc=params.get("label_n_mc", 2048),
-                    k_cond_triples=params.get("label_k_cond_triples", 16),
+                    n_oracle=params.get("label_n_oracle", 512),
+                    mixture=params.get("label_mixture", "backup"),
                     mode=mode,
+                    label_estimator=params.get("label_estimator", "histogram"),
+                    label_knn_folds=params.get("label_knn_folds", 5),
+                    label_knn_k=params.get("label_knn_k", None),
                 )
             else:
-                p = params["num_features"]
                 labels = {
-                    "o_star": torch.full((p,), float("nan")),
-                    "i_star": torch.full((p,), float("nan")),
-                    "c_triples": [],
-                    "is_identifiable": False,
+                    "value_queries": [],
+                    "y_var_raw": float("nan"),
+                    "label_scale": "rms_y_units",
                 }
 
             X, y = Reg2Cls(params)(X_raw, y_raw)
@@ -620,19 +613,22 @@ class SCMPrior(Prior):
             Batch size override. If None, uses self.batch_size.
 
         return_labels : bool, default=True
-            If ``True``, also return Phase 3 attribution labels
-            (``o_star``, ``i_star``, ``is_identifiable``, ``c_triples``) in a
-            nine-tuple. Setting this to ``False`` restores the original
-            five-tuple signature for callers that predate Phase 3.
+            If ``True``, also return the per-dataset conditional predictive
+            value labels as a list-of-dicts (one entry per batch element) in
+            a six-tuple. Setting this to ``False`` restores the original
+            five-tuple signature for callers that predate attribution labels.
 
         Returns
         -------
-        Nine-tuple (``return_labels=True``) of::
+        Six-tuple (``return_labels=True``) of::
 
-            X, y, d, seq_lens, train_sizes,
-            o_star, i_star, is_identifiable, c_triples
+            X, y, d, seq_lens, train_sizes, labels
 
-        or the original five-tuple (``return_labels=False``).
+        where ``labels`` is ``list[dict]`` of length ``B`` with keys
+        ``"value_queries"``, ``"y_var_raw"``, ``"label_scale"``. The
+        ``value_queries`` entry is itself a ``list[ValueQuery]``.
+
+        Or the original five-tuple (``return_labels=False``).
         """
         batch_size = batch_size or self.batch_size
 
@@ -750,22 +746,10 @@ class SCMPrior(Prior):
         if not return_labels:
             return X, y, d, seq_lens, train_sizes
 
-        # Pad per-sample label tensors to the global max_features so they
-        # stack cleanly. NaN (not zero) because zero is a meaningful label
-        # value; NaN signals "no label here".
-        max_feat = self.max_features
-        o_star = torch.full((len(labels_list), max_feat), float("nan"), device=self.device)
-        i_star = torch.full((len(labels_list), max_feat), float("nan"), device=self.device)
-        is_identifiable = torch.zeros(len(labels_list), dtype=torch.bool, device=self.device)
-        c_triples: list = []
-        for b, lab in enumerate(labels_list):
-            p = lab["o_star"].shape[0]
-            o_star[b, :p] = lab["o_star"].to(self.device)
-            i_star[b, :p] = lab["i_star"].to(self.device)
-            is_identifiable[b] = bool(lab["is_identifiable"])
-            c_triples.append(lab["c_triples"])
-
-        return X, y, d, seq_lens, train_sizes, o_star, i_star, is_identifiable, c_triples
+        # Labels stay as list[dict] — one entry per batch element. Per-dataset
+        # feature counts (and therefore ValueQuery.S_mask widths) vary, so
+        # there is no natural stacking. The loss consumes the list directly.
+        return X, y, d, seq_lens, train_sizes, list(labels_list)
 
     def get_prior(self) -> str:
         """Determine which prior type to use for generation.
@@ -780,10 +764,6 @@ class SCMPrior(Prior):
         """
         if self.prior_type == "mix_scm":
             return np.random.choice(["mlp_scm", "tree_scm"], p=self.fixed_hp.get("mix_probas", [0.7, 0.3]))
-        if self.prior_type == "mix_scm_identifiable":
-            # Uniform over the three identifiable families. Phase 3
-            # benchmark exercises this as a single combined prior.
-            return str(np.random.choice(["lingam_scm", "anm_scm", "tree_path_scm"]))
         return self.prior_type
 
 
@@ -883,11 +863,11 @@ class DummyPrior(Prior):
         if not return_labels:
             return X, y, d, seq_lens, train_sizes
 
-        o_star = torch.full((batch_size, self.max_features), float("nan"), device=self.device)
-        i_star = torch.full((batch_size, self.max_features), float("nan"), device=self.device)
-        is_identifiable = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        c_triples: list = [[] for _ in range(batch_size)]
-        return X, y, d, seq_lens, train_sizes, o_star, i_star, is_identifiable, c_triples
+        labels = [
+            {"value_queries": [], "y_var_raw": float("nan"), "label_scale": "rms_y_units"}
+            for _ in range(batch_size)
+        ]
+        return X, y, d, seq_lens, train_sizes, labels
 
 
 class PriorDataset(IterableDataset):
@@ -1000,15 +980,7 @@ class PriorDataset(IterableDataset):
                 max_train_size=max_train_size,
                 device=device,
             )
-        elif prior_type in [
-            "mlp_scm",
-            "tree_scm",
-            "mix_scm",
-            "lingam_scm",
-            "anm_scm",
-            "tree_path_scm",
-            "mix_scm_identifiable",
-        ]:
+        elif prior_type in ["mlp_scm", "tree_scm", "mix_scm"]:
             self.prior = SCMPrior(
                 batch_size=batch_size,
                 batch_size_per_gp=batch_size_per_gp,
@@ -1033,8 +1005,7 @@ class PriorDataset(IterableDataset):
         else:
             raise ValueError(
                 f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', "
-                "'tree_scm', 'mix_scm', 'lingam_scm', 'anm_scm', 'tree_path_scm', "
-                "'mix_scm_identifiable', or 'dummy'."
+                "'tree_scm', 'mix_scm', or 'dummy'."
             )
 
         self.batch_size = batch_size
@@ -1059,11 +1030,10 @@ class PriorDataset(IterableDataset):
     ) -> Tuple:
         """Generate a new batch of datasets.
 
-        When ``return_labels`` is True (default), the nine-tuple contains Phase
-        3 attribution-label tensors padded to ``max_features``::
+        When ``return_labels`` is True (default), the six-tuple ends with a
+        ``list[dict]`` of per-dataset conditional predictive value labels::
 
-            X, y, d, seq_lens, train_sizes,
-            o_star, i_star, is_identifiable, c_triples
+            X, y, d, seq_lens, train_sizes, labels
 
         Set ``return_labels=False`` to preserve the original five-tuple
         signature for callers that predate Phase 3.

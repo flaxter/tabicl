@@ -1,21 +1,32 @@
-"""Phase 6 — attribution evaluation utilities.
-
-This subpackage ships the metrics and evaluation harness used to score
-trained attribution heads against the Phase 3 ground-truth labels.
-
-Phase 6e (head-only fine-tuning) is the first consumer; Phase 6a–d
-reuse the same primitives on different prior configurations.
-"""
+"""Attribution-evaluation utilities for the conditional predictive value head."""
+from .explainer_eval import (
+    DatasetScore,
+    EvalCase,
+    EvalSuite,
+    GroundTruth,
+    build_held_out_prior_suite,
+    build_in_distribution_suite,
+    evaluate_explainer,
+    write_scores_csv,
+)
 from .metrics import (
-    spearman_per_dataset,
-    pearson_per_dataset,
-    topk_recall_per_dataset,
     aggregate_metrics,
+    pearson_per_dataset,
+    spearman_per_dataset,
+    topk_recall_per_dataset,
 )
 
 __all__ = [
-    "spearman_per_dataset",
-    "pearson_per_dataset",
-    "topk_recall_per_dataset",
+    "DatasetScore",
+    "EvalCase",
+    "EvalSuite",
+    "GroundTruth",
     "aggregate_metrics",
+    "build_held_out_prior_suite",
+    "build_in_distribution_suite",
+    "evaluate_explainer",
+    "pearson_per_dataset",
+    "spearman_per_dataset",
+    "topk_recall_per_dataset",
+    "write_scores_csv",
 ]

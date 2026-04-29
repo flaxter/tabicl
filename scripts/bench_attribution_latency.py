@@ -1,379 +1,293 @@
-"""Phase 6c — attribution latency: TabICLExplainer vs KernelSHAP.
+"""KernelSHAP vs. conditional predictive value oracle — latency comparison.
 
-Measures wall-clock cost of native attribution (one trunk forward pass
-populating Heads A/I and caching embeddings for Head C) against the
-KernelSHAP baseline on ``TabICLClassifier.predict_proba`` at several
-sample budgets.
+Runs the grid locked in preregistration §11.5:
 
-Attribution *quality* is out of scope — heads are randomly initialised.
-The Phase 6c speedup heatmap only needs wall-clock numbers, and a
-realised trained checkpoint is a separate deliverable (Task 7).
+    p   in {8, 16, 32}
+    n   in {500, 2000}
+    n_Q in {1, 10, 100}    # number of information states queried
 
-Grid:
+For each (p, n), fit the base estimator once. Then:
 
-- ``n_train`` ∈ {100, 500, 2000, 10000}
-- ``p``       ∈ {5, 20, 100}
-- ``n_explain`` fixed (default 10)
-- KernelSHAP ``nsamples`` ∈ {256, 512, 1024}
-- A hard per-KernelSHAP-call wall-clock cap (default 300 s) prevents a
-  single big cell eating the whole SLURM job. Subsequent higher-budget
-  calls in the same cell are skipped once the smallest budget times out.
+- ``kernelshap``: build a ``shap.KernelExplainer`` and call
+  ``shap_values`` on the full training matrix. This is a single-call
+  KernelSHAP budget (the standard SHAP reporting unit).
+- ``oracle``: sample ``n_Q`` random information states ``S`` and call
+  ``TabICLExplainer.conditional_predictive_values(S)`` for each.
 
-CSV columns (flushed per row, db2b64d precedent from bench_labels.py):
+Reports wall-clock seconds per operation + relative speedup to a CSV.
 
-``method, n_shap_samples, n_train, p, n_explain, wall_clock_s,
-timed_out, notes``
-
-Rows emitted per (n_train, p) cell:
-
-- ``tabicl_explainer_fit`` — one ``expl.fit(X, y)`` with random-init heads
-  (includes the base-estimator ``.fit`` that runs inside; separately
-  captured as ``tabicl_base_fit`` so downstream analysis can subtract).
-- ``tabicl_base_fit``      — ``base.fit(X, y)`` only (classification path).
-- ``head_c_small|medium|large`` — ``expl.marginal_conditional_contributions(S)``
-  for three conditioning-set sizes (on the already-fit explainer).
-- ``kernel_shap``          — ``KernelExplainer.shap_values`` at each
-  ``nsamples`` budget.
-
-Usage
------
-
-Local smoke (two-cell tiny grid, < 2 min)::
-
-    uv run python scripts/bench_attribution_latency.py \\
-        --smoke --out /tmp/smoke.csv
-
-Full run on arc (see ``learning-to-explain/bench_attribution_latency.slurm``)::
-
-    uv run python scripts/bench_attribution_latency.py \\
-        --out results/bench_attribution_latency.csv
-
-Notes
------
-
-PLAN §6c nominally includes ``p=500`` and ``n_train=50000``; these are
-excluded from the first-pass grid because KernelSHAP runtime on arc CPU
-would be brutal. They are deliberately left for a later full sweep.
+The §11.5 success criterion is that at ``n_Q = 10`` the total cost
+(one fit + 10 queries) is at most the cost of a single KernelSHAP call.
+No claim is made that one forward pass computes all ``S`` — we report
+cost per information state honestly.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import sys
 import time
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import numpy as np
-import torch
-from sklearn.datasets import make_classification
-
-from tabicl import TabICLClassifier, TabICLExplainer
-from tabicl.model.heads import (
-    ConditionalHead,
-    InterventionalHead,
-    ObservationalHead,
-)
 
 
-# --------------------------------------------------------------------------
-# Timeout helper
-#
-# SIGALRM-based interrupt was unreliable under SLURM: on arc a 300 s cap
-# around ``shap.KernelExplainer.shap_values`` did not fire even after
-# several hundred seconds past the alarm. The root cause is hard to pin
-# down (possibly GIL-release patterns inside KernelSHAP's inner NumPy
-# loops), so we side-step it: we wrap the base estimator's
-# ``predict_proba`` to raise ``_Timeout`` *from the next call* once the
-# wall-clock cap is exceeded. KernelSHAP invokes ``predict_proba`` many
-# times per ``shap_values`` call, so the cap trips within one inner-loop
-# iteration — usually a small fraction of a second after the cap.
-# --------------------------------------------------------------------------
+P_GRID = (8, 16, 32)
+N_GRID = (500, 2000)
+N_Q_GRID = (1, 10, 100)
 
 
-class _Timeout(BaseException):
-    """Subclass of ``BaseException`` so a broad ``except Exception:`` in
-    shap / numba / torch cannot swallow the cap and keep the
-    predict_proba loop running past the wall-clock limit.
-    """
+@dataclass
+class LatencyRow:
+    method: str
+    p: int
+    n: int
+    n_Q: int
+    seconds_fit: float
+    seconds_query: float
+    seconds_total: float
+    seconds_per_state: float
+    notes: str = ""
 
 
-def _capped_predict_proba(
-    base, start_time: float, cap_s: Optional[int]
-) -> Callable:
-    """Return a ``predict_proba``-shaped callable that enforces a cap.
-
-    Raises :class:`_Timeout` on the first invocation after
-    ``time.perf_counter() - start_time > cap_s``. ``cap_s=None`` or
-    ``<= 0`` disables the cap.
-    """
-    if not cap_s or cap_s <= 0:
-        return base.predict_proba
-
-    def _wrapped(X):
-        if time.perf_counter() - start_time > cap_s:
-            raise _Timeout()
-        return base.predict_proba(X)
-
-    return _wrapped
+# ---------------------------------------------------------------------------
+# Synthetic generator
+# ---------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------
-# Head / data / base helpers
-# --------------------------------------------------------------------------
-
-
-def _fresh_heads(embed_dim: int) -> Dict[str, torch.nn.Module]:
-    """Random-init attribution heads sized for ``embed_dim``.
-
-    ``hidden_dim = embed_dim // 2`` matches ``tabicl/tests/test_explainer.py``
-    and the Phase 2 default.
-    """
-    hidden_dim = embed_dim // 2
-    # Deterministic init for reproducibility; weights aren't evaluated,
-    # only timed.
-    torch.manual_seed(0)
-    return {
-        "observational": ObservationalHead(embed_dim=embed_dim, hidden_dim=hidden_dim),
-        "interventional": InterventionalHead(embed_dim=embed_dim, hidden_dim=hidden_dim),
-        "conditional": ConditionalHead(embed_dim=embed_dim, hidden_dim=hidden_dim),
-    }
-
-
-def _make_data(n_train: int, p: int, n_explain: int, seed: int):
-    """Synthetic binary classification — pure latency bench, no identifiability."""
-    n_total = n_train + n_explain
-    # n_informative capped at p so make_classification accepts the combo.
-    n_informative = min(p, max(2, p // 2))
-    X, y = make_classification(
-        n_samples=n_total,
-        n_features=p,
-        n_informative=n_informative,
-        n_redundant=0,
-        n_classes=2,
-        random_state=seed,
+def _synth(p: int, n: int, *, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """Linear-Gaussian synthetic: ``Y = sum(beta_i X_i) + eps``, ``beta`` sparse."""
+    X = rng.standard_normal((n, p))
+    beta = np.zeros(p)
+    active = rng.choice(p, size=max(1, p // 3), replace=False)
+    beta[active] = rng.uniform(0.5, 2.0, size=active.size) * rng.choice(
+        [-1.0, 1.0], size=active.size
     )
-    X = X.astype(np.float32)
-    return X[:n_train], y[:n_train], X[n_train:n_train + n_explain]
+    y = X @ beta + 0.1 * rng.standard_normal(n)
+    return X, y
 
 
-def _make_base() -> "TabICLClassifier":
-    """A vanilla TabICLClassifier with the default released checkpoint."""
-    return TabICLClassifier(n_estimators=1, random_state=0, verbose=False, device="cpu")
+def _sample_states(p: int, n_Q: int, *, rng: np.random.Generator) -> List[List[int]]:
+    """Draw ``n_Q`` random information states ``S``, covering diverse |S|."""
+    states: List[List[int]] = []
+    for _ in range(n_Q):
+        # Uniform |S| across [0, p-1], then uniform feature subset of that size.
+        k = int(rng.integers(0, p))
+        sel = rng.choice(p, size=k, replace=False) if k > 0 else np.array([], dtype=int)
+        states.append(sorted(int(j) for j in sel))
+    return states
 
 
-# --------------------------------------------------------------------------
-# Benchmark
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# KernelSHAP backend
+# ---------------------------------------------------------------------------
 
 
-FIELDNAMES = [
-    "method",
-    "n_shap_samples",
-    "n_train",
-    "p",
-    "n_explain",
-    "wall_clock_s",
-    "timed_out",
-    "notes",
-]
-
-
-def _run_cell(
-    n_train: int,
-    p: int,
-    n_explain: int,
-    shap_nsamples: List[int],
-    time_cap_s: int,
-    seed: int,
-    embed_dim: int,
-    writer: csv.DictWriter,
-    fh,
-) -> None:
-    """Run every method for one ``(n_train, p)`` cell and flush rows."""
-
-    def emit(method: str, wall_clock_s: float, timed_out: bool,
-             n_shap_samples: Optional[int] = None, notes: str = "") -> None:
-        row = {
-            "method": method,
-            "n_shap_samples": "" if n_shap_samples is None else int(n_shap_samples),
-            "n_train": n_train,
-            "p": p,
-            "n_explain": n_explain,
-            "wall_clock_s": round(float(wall_clock_s), 4),
-            "timed_out": "true" if timed_out else "false",
-            "notes": notes,
-        }
-        writer.writerow(row)
-        fh.flush()
-        print(
-            f"  {method:>22s}"
-            f"{'' if n_shap_samples is None else f' ns={n_shap_samples}':>10s}"
-            f"  t={wall_clock_s:>7.3f}s"
-            f"{'  TIMED OUT' if timed_out else ''}"
-            f"{('  [' + notes + ']') if notes else ''}",
-            flush=True,
-        )
-
-    X_train, y_train, X_explain = _make_data(n_train, p, n_explain, seed=seed)
-
-    # ------------------------------------------------------------------
-    # 1. tabicl_base_fit — TabICLClassifier.fit in isolation (for later
-    #    subtraction from the explainer-fit wall-clock).
-    # ------------------------------------------------------------------
-    base_for_shap = _make_base()
-    t0 = time.perf_counter()
-    base_for_shap.fit(X_train, y_train)
-    t_base_fit = time.perf_counter() - t0
-    emit("tabicl_base_fit", t_base_fit, timed_out=False)
-
-    # Sanity-check embed_dim matches our hand-off value.
-    actual_embed_dim = int(base_for_shap.model_config_["embed_dim"])
-    if actual_embed_dim != embed_dim:
-        emit(
-            "warn_embed_dim_mismatch", 0.0, timed_out=False,
-            notes=f"expected {embed_dim}, got {actual_embed_dim}",
-        )
-        embed_dim = actual_embed_dim  # trust reality over hand-off
-
-    # ------------------------------------------------------------------
-    # 2. tabicl_explainer_fit — fresh base + fresh heads, one pass.
-    #    This refits the base (explainer .fit calls base.fit), so
-    #    wall_clock_s includes the base fit captured separately above.
-    # ------------------------------------------------------------------
-    base_for_expl = _make_base()
-    heads = _fresh_heads(embed_dim=embed_dim)
-    expl = TabICLExplainer(base_estimator=base_for_expl, heads=heads)
-
-    t0 = time.perf_counter()
-    expl.fit(X_train, y_train)
-    t_expl_fit = time.perf_counter() - t0
-    emit(
-        "tabicl_explainer_fit", t_expl_fit, timed_out=False,
-        notes="includes base.fit",
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Head C query latency — three conditioning-set sizes.
-    # ------------------------------------------------------------------
-    small_S: List[int] = [0] if p >= 1 else []
-    medium_S = list(range(min(p // 2, 10)))
-    large_S = list(range(max(0, p - 2)))  # leave at least 2 features to score
-
-    for label, S in [
-        ("head_c_small", small_S),
-        ("head_c_medium", medium_S),
-        ("head_c_large", large_S),
-    ]:
-        t0 = time.perf_counter()
-        _ = expl.marginal_conditional_contributions(S=S)
-        t = time.perf_counter() - t0
-        emit(label, t, timed_out=False, notes=f"|S|={len(S)}")
-
-    # ------------------------------------------------------------------
-    # 4. KernelSHAP baseline. If the smallest nsamples times out, skip
-    #    the larger budgets — they will only be slower.
-    # ------------------------------------------------------------------
-    # Lazy import so the module loads without shap if someone runs
-    # with --skip-shap.
+def _time_kernelshap(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    n_shap: int,
+    n_background: int,
+    nsamples: int,
+    device: str,
+) -> LatencyRow:
     import shap
+    from tabicl import TabICLRegressor
 
-    background_size = min(100, X_train.shape[0])
-    background = shap.sample(X_train, background_size, random_state=seed)
+    t0 = time.time()
+    base = TabICLRegressor(device=device).fit(X, y)
+    fit_time = time.time() - t0
 
-    skip_remaining = False
-    for ns in sorted(shap_nsamples):
-        if skip_remaining:
-            emit(
-                "kernel_shap", float("nan"), timed_out=True, n_shap_samples=ns,
-                notes=f"skipped after smaller budget hit {time_cap_s}s cap",
-            )
-            continue
+    bg = shap.sample(X, n_background, random_state=42)
+    explainer = shap.KernelExplainer(base.predict, bg)
+    idx = np.random.default_rng(0).choice(X.shape[0], size=min(n_shap, X.shape[0]), replace=False)
 
-        t0 = time.perf_counter()
-        capped = _capped_predict_proba(base_for_shap, t0, time_cap_s)
-        ks = shap.KernelExplainer(capped, background)
-        timed_out = False
-        notes = ""
-        try:
-            # silent=True suppresses shap's tqdm bar under SLURM.
-            ks.shap_values(X_explain, nsamples=ns, silent=True)
-        except _Timeout:
-            timed_out = True
-            notes = f"exceeded {time_cap_s}s cap"
-            skip_remaining = True
-        t = time.perf_counter() - t0
-        emit("kernel_shap", t, timed_out, n_shap_samples=ns, notes=notes)
+    t1 = time.time()
+    _ = explainer.shap_values(X[idx], nsamples=nsamples, silent=True)
+    query_time = time.time() - t1
 
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    ap.add_argument("--out", default="results/bench_attribution_latency.csv")
-    ap.add_argument("--grid-n", default="100,500,2000,10000")
-    ap.add_argument("--grid-p", default="5,20,100")
-    ap.add_argument("--n-explain", type=int, default=10)
-    ap.add_argument("--shap-nsamples", default="256,512,1024")
-    ap.add_argument(
-        "--time-cap-s", type=int, default=300,
-        help="Hard per-KernelSHAP-call wall-clock cap (seconds). "
-             "The subsequent larger-budget calls in the same cell are "
-             "skipped once the smallest budget trips the cap. 0 disables.",
+    return LatencyRow(
+        method="kernelshap",
+        p=int(X.shape[1]),
+        n=int(X.shape[0]),
+        n_Q=n_shap,          # reuse column: "n_Q" = n_shap rows explained
+        seconds_fit=fit_time,
+        seconds_query=query_time,
+        seconds_total=fit_time + query_time,
+        seconds_per_state=query_time / max(n_shap, 1),
+        notes=f"nsamples={nsamples} bg={n_background}",
     )
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument(
-        "--embed-dim", type=int, default=128,
-        help="Hand-off embed_dim used to size the random-init heads "
-             "before the first fit. The default released TabICLClassifier "
-             "checkpoint has embed_dim=128; mismatches are logged and the "
-             "runtime value is used instead.",
+
+
+# ---------------------------------------------------------------------------
+# Oracle backend
+# ---------------------------------------------------------------------------
+
+
+def _time_oracle(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    n_Q: int,
+    checkpoint: str,
+    device: str,
+    rng: np.random.Generator,
+) -> LatencyRow:
+    from tabicl import TabICLRegressor
+    from tabicl.sklearn.explainer import TabICLExplainer
+
+    t0 = time.time()
+    base = TabICLRegressor(device=device)
+    expl = TabICLExplainer(
+        base_estimator=base,
+        heads_checkpoint_path=checkpoint,
+        device=device,
+    ).fit(X, y)
+    fit_time = time.time() - t0
+
+    states = _sample_states(int(X.shape[1]), n_Q, rng=rng)
+    t1 = time.time()
+    for S in states:
+        _ = expl.conditional_predictive_values(S)
+    query_time = time.time() - t1
+
+    return LatencyRow(
+        method="oracle",
+        p=int(X.shape[1]),
+        n=int(X.shape[0]),
+        n_Q=n_Q,
+        seconds_fit=fit_time,
+        seconds_query=query_time,
+        seconds_total=fit_time + query_time,
+        seconds_per_state=query_time / max(n_Q, 1),
+        notes=f"device={device}",
     )
-    ap.add_argument(
-        "--smoke", action="store_true",
-        help="Tiny two-cell grid for pre-SLURM sanity checks (<2 min).",
-    )
-    args = ap.parse_args()
 
-    if args.smoke:
-        args.grid_n = "100"
-        args.grid_p = "5"
-        args.shap_nsamples = "256"
 
-    ns_list = [int(x) for x in args.grid_n.split(",") if x.strip()]
-    ps_list = [int(x) for x in args.grid_p.split(",") if x.strip()]
-    shap_nsamples = [int(x) for x in args.shap_nsamples.split(",") if x.strip()]
+# ---------------------------------------------------------------------------
+# Top-level driver
+# ---------------------------------------------------------------------------
 
-    out_path = Path(args.out)
+
+def _write_csv(rows: Sequence[LatencyRow], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [f.name for f in LatencyRow.__dataclass_fields__.values()]  # type: ignore[attr-defined]
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(asdict(r))
 
-    print(
-        f"bench_attribution_latency: "
-        f"grid n_train={ns_list} p={ps_list} "
-        f"shap_nsamples={shap_nsamples} n_explain={args.n_explain} "
-        f"time_cap_s={args.time_cap_s}",
-        flush=True,
-    )
 
-    with open(out_path, "w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        fh.flush()
+def run_grid(
+    *,
+    checkpoint: str,
+    out_csv: Path,
+    p_grid: Sequence[int] = P_GRID,
+    n_grid: Sequence[int] = N_GRID,
+    n_Q_grid: Sequence[int] = N_Q_GRID,
+    shap_background: int = 100,
+    shap_nsamples: int = 512,
+    shap_rows_explained: int = 10,
+    device: str = "cpu",
+    seed: int = 0,
+) -> List[LatencyRow]:
+    """Run the full grid and return rows. Writes CSV when ``out_csv`` is given."""
+    rng = np.random.default_rng(seed)
+    rows: List[LatencyRow] = []
+    for p in p_grid:
+        for n in n_grid:
+            X, y = _synth(p, n, rng=rng)
 
-        for n_train in ns_list:
-            for p in ps_list:
-                print(f"\n=== cell n_train={n_train} p={p} ===", flush=True)
-                _run_cell(
-                    n_train=n_train,
-                    p=p,
-                    n_explain=args.n_explain,
-                    shap_nsamples=shap_nsamples,
-                    time_cap_s=args.time_cap_s,
-                    seed=args.seed,
-                    embed_dim=args.embed_dim,
-                    writer=writer,
-                    fh=fh,
+            # One KernelSHAP measurement per (p, n) (it is not n_Q-dependent).
+            ks = _time_kernelshap(
+                X, y,
+                n_shap=shap_rows_explained,
+                n_background=shap_background,
+                nsamples=shap_nsamples,
+                device=device,
+            )
+            rows.append(ks)
+            print(
+                f"[latency] kernelshap p={p:>3} n={n:>4} "
+                f"fit={ks.seconds_fit:.2f}s query={ks.seconds_query:.2f}s "
+                f"per_row={ks.seconds_per_state:.3f}s",
+                flush=True,
+            )
+
+            for n_Q in n_Q_grid:
+                oc = _time_oracle(
+                    X, y,
+                    n_Q=n_Q,
+                    checkpoint=checkpoint,
+                    device=device,
+                    rng=rng,
+                )
+                rows.append(oc)
+                print(
+                    f"[latency] oracle     p={p:>3} n={n:>4} n_Q={n_Q:>3} "
+                    f"fit={oc.seconds_fit:.2f}s query={oc.seconds_query:.2f}s "
+                    f"per_state={oc.seconds_per_state:.3f}s",
+                    flush=True,
                 )
 
-    print(f"\nWrote {out_path}", flush=True)
+    _write_csv(rows, out_csv)
+    return rows
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--checkpoint", required=True,
+        help="Path to a training checkpoint with the value-head state dict.",
+    )
+    parser.add_argument(
+        "--out", default="results/bench_attribution_latency.csv",
+        help="Output CSV path.",
+    )
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="Single point p=8, n=500, n_Q=10 — arc devel shape check.",
+    )
+    parser.add_argument("--p-grid", type=int, nargs="+", default=list(P_GRID))
+    parser.add_argument("--n-grid", type=int, nargs="+", default=list(N_GRID))
+    parser.add_argument("--nq-grid", type=int, nargs="+", default=list(N_Q_GRID))
+    parser.add_argument("--shap-nsamples", type=int, default=512)
+    parser.add_argument("--shap-background", type=int, default=100)
+    parser.add_argument("--shap-rows-explained", type=int, default=10)
+    args = parser.parse_args(argv)
+
+    if not Path(args.checkpoint).exists():
+        print(f"[bench_attribution_latency] checkpoint not found: {args.checkpoint}", file=sys.stderr)
+        return 2
+
+    if args.smoke:
+        args.p_grid = [8]
+        args.n_grid = [500]
+        args.nq_grid = [10]
+        args.shap_rows_explained = 3
+
+    out_csv = Path(args.out)
+    rows = run_grid(
+        checkpoint=args.checkpoint,
+        out_csv=out_csv,
+        p_grid=args.p_grid,
+        n_grid=args.n_grid,
+        n_Q_grid=args.nq_grid,
+        shap_background=args.shap_background,
+        shap_nsamples=args.shap_nsamples,
+        shap_rows_explained=args.shap_rows_explained,
+        device=args.device,
+        seed=args.seed,
+    )
+    print(f"[bench_attribution_latency] wrote {len(rows)} rows -> {out_csv}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -23,10 +23,10 @@ from tqdm import tqdm
 import wandb
 
 from tabicl.model.tabicl import TabICL
-from tabicl.model.heads import ConditionalHead, InterventionalHead, ObservationalHead
+from tabicl.model.heads import ConditionalPredictiveValueHead
 from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
-from tabicl.train.multi_task_loss import MultiTaskLoss
+from tabicl.train.multi_task_loss import PredictiveValueLoss
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
 
@@ -175,6 +175,13 @@ class Trainer:
         if isinstance(col_feature_group, str) and col_feature_group.lower() == "false":
             col_feature_group = False
 
+        def _ssmax(v):
+            if isinstance(v, str) and v.lower() in {"false", "none", "off"}:
+                return False
+            if isinstance(v, str) and v.lower() == "true":
+                return True
+            return v
+
         self.model_config = {
             "max_classes": self.config.max_classes,
             "embed_dim": self.config.embed_dim,
@@ -182,16 +189,20 @@ class Trainer:
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
+            "col_target_aware": getattr(self.config, "col_target_aware", True),
+            "col_ssmax": _ssmax(getattr(self.config, "col_ssmax", "qassmax-mlp-elementwise")),
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
             "row_num_cls": self.config.row_num_cls,
             "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
+            "icl_ssmax": _ssmax(getattr(self.config, "icl_ssmax", "qassmax-mlp-elementwise")),
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "bias_free_ln": getattr(self.config, "bias_free_ln", False),
         }
 
         model = TabICL(**self.model_config)
@@ -223,11 +234,22 @@ class Trainer:
             if self.master_process:
                 print("Model compiled successfully.")
 
-        # Wrap model into DDP container if using distributed training
-        if self.ddp:
+        # Wrap model into DDP container if using distributed training.
+        # Heads-only training freezes col/row/icl (the only trunk modules),
+        # which leaves TabICL with zero trainable parameters — DDP's init
+        # rejects that. The value head that *is* trainable lives on
+        # ``loss_fn``, not on ``model``, so we can safely skip the wrap; a
+        # single-process ``torchrun`` has nothing to all-reduce anyway.
+        num_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        if self.ddp and num_trainable > 0:
             self.model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False)
             self.raw_model = self.model.module
         else:
+            if self.ddp and num_trainable == 0 and self.master_process:
+                print(
+                    "Model has no trainable parameters (heads-only run); skipping DDP wrap.",
+                    flush=True,
+                )
             self.model = model
             self.raw_model = model
 
@@ -246,12 +268,10 @@ class Trainer:
         self.trunk_params = list(self.raw_model.parameters())
 
     def build_attribution_heads(self, model: TabICL) -> None:
-        """Phase 4: attach the three attribution heads + multi-task loss.
+        """Attach the conditional predictive value head + prediction+value loss.
 
-        Heads are plain ``nn.Module``s that consume
-        ``model(return_column_embeddings=True)``'s second return value.
-        ``MultiTaskLoss`` owns them so a single ``loss.backward()`` covers
-        trunk + heads + learned log-sigmas.
+        ``PredictiveValueLoss`` owns the head so a single ``loss.backward()``
+        covers trunk + head + learned log-sigmas.
         """
         if not getattr(self.config, "multi_task_enabled", False):
             self.loss_fn = None
@@ -259,28 +279,51 @@ class Trainer:
 
         embed_dim = self.config.embed_dim
         hidden = self.config.head_embed_dim or None
-        head_a = ObservationalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
-        head_i = InterventionalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
-        head_c = ConditionalHead(embed_dim=embed_dim, hidden_dim=hidden).to(self.config.device)
+        value_head = ConditionalPredictiveValueHead(
+            embed_dim=embed_dim, hidden_dim=hidden
+        ).to(self.config.device)
 
         lambdas = {
             "pred": self.config.lambda_pred,
-            "obs": self.config.lambda_obs,
-            "int": self.config.lambda_int,
-            "cond": self.config.lambda_cond,
+            "value": getattr(self.config, "lambda_value", 1.0),
         }
-        self.loss_fn = MultiTaskLoss(
-            head_a=head_a, head_i=head_i, head_c=head_c,
+        self.loss_fn = PredictiveValueLoss(
+            value_head=value_head,
             weighting=self.config.multi_task_weighting,
             lambdas=lambdas,
             huber_delta=self.config.huber_delta,
-            head_c_consistency_weight=self.config.head_c_consistency_weight,
         ).to(self.config.device)
 
     def configure_prior(self):
         """Set up a tabular dataset generator for synthetic data during training."""
 
         if self.config.prior_dir is None:
+            from tabicl.prior.prior_config import DEFAULT_FIXED_HP
+            fixed_hp_overrides = dict(DEFAULT_FIXED_HP)
+            for key in (
+                "label_estimator",
+                "label_mixture",
+                "label_n_oracle",
+                "label_knn_folds",
+                "label_knn_k",
+            ):
+                val = getattr(self.config, key, None)
+                if val is not None:
+                    fixed_hp_overrides[key] = val
+            if self.master_process and any(
+                getattr(self.config, k, None) is not None
+                for k in ("label_estimator", "label_mixture",
+                          "label_n_oracle", "label_knn_folds", "label_knn_k")
+            ):
+                print(
+                    "[labels] overrides:",
+                    {
+                        k: fixed_hp_overrides.get(k)
+                        for k in ("label_estimator", "label_mixture",
+                                  "label_n_oracle", "label_knn_folds", "label_knn_k")
+                    },
+                )
+
             # Generate prior data on the fly
             dataset = PriorDataset(
                 batch_size=self.config.batch_size,
@@ -296,6 +339,7 @@ class Trainer:
                 max_train_size=self.config.max_train_size,
                 replay_small=self.config.replay_small,
                 prior_type=self.config.prior_type,
+                scm_fixed_hp=fixed_hp_overrides,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism during DDP
             )
@@ -402,7 +446,40 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        self.raw_model.load_state_dict(checkpoint["state_dict"])
+        load_strict = getattr(self.config, "load_model_strict", True)
+        state_dict = checkpoint["state_dict"]
+        if not load_strict:
+            # strict=False only ignores keys present in one side but not
+            # the other; it still raises on size-mismatches between
+            # keys present in both. When loading an upstream v1/v2
+            # checkpoint into a Phase-4 multi-task config, the y_encoder
+            # and decoder output-head tensors can disagree in shape
+            # (e.g. 1 regression target vs max_classes=10, 999 quantile
+            # bins vs 10 classes). Drop those keys so the load succeeds
+            # and the affected layers keep their fresh-init weights.
+            model_state = self.raw_model.state_dict()
+            dropped = []
+            filtered = {}
+            for k, v in state_dict.items():
+                if k in model_state and tuple(model_state[k].shape) != tuple(v.shape):
+                    dropped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+                    continue
+                filtered[k] = v
+            if dropped:
+                print(
+                    f"[load_checkpoint] dropping {len(dropped)} keys with size mismatch: "
+                    f"{dropped[:3]}{'...' if len(dropped) > 3 else ''}",
+                    flush=True,
+                )
+            state_dict = filtered
+        missing, unexpected = self.raw_model.load_state_dict(
+            state_dict, strict=load_strict
+        )
+        if not load_strict:
+            if missing:
+                print(f"[load_checkpoint] missing keys ({len(missing)}): {missing[:5]}{'...' if len(missing) > 5 else ''}", flush=True)
+            if unexpected:
+                print(f"[load_checkpoint] unexpected keys ({len(unexpected)}): {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}", flush=True)
 
         # Optionally load optimizer and scheduler state
         if self.config.only_load_model:
@@ -431,13 +508,11 @@ class Trainer:
             "scheduler_state": self.scheduler.state_dict(),
             "curr_step": self.curr_step,
         }
-        # Phase 5: persist attribution-head state so TabICLExplainer can
-        # reconstruct the heads without re-running training.
+        # Persist value-head state so TabICLExplainer can reconstruct it
+        # without re-running training.
         if getattr(self, "loss_fn", None) is not None:
             checkpoint["heads"] = {
-                "observational": self.loss_fn.head_a.state_dict(),
-                "interventional": self.loss_fn.head_i.state_dict(),
-                "conditional": self.loss_fn.head_c.state_dict(),
+                "value": self.loss_fn.value_head.state_dict(),
                 "config": {
                     "embed_dim": self.config.embed_dim,
                     "hidden_dim": self.config.head_embed_dim,
@@ -620,8 +695,9 @@ class Trainer:
         micro_batch : tuple
             Either a 5-tuple ``(X, y, d, seq_len, train_size)`` (original
             TabICL signature; preserved for ``multi_task_enabled=False``) or a
-            9-tuple with the four Phase 3 label outputs appended:
-            ``(X, y, d, seq_len, train_size, o_star, i_star, is_id, c_triples)``.
+            6-tuple ``(X, y, d, seq_len, train_size, labels)`` where
+            ``labels`` is a ``list[dict]`` of per-dataset value-query
+            payloads.
 
         micro_batch_idx : int
             Index of the current micro batch.
@@ -633,18 +709,16 @@ class Trainer:
         -------
         dict
             Metrics for logging: at minimum ``ce`` and ``accuracy``; with
-            multi-task training, also ``loss_A``, ``loss_I``, ``loss_C``,
-            ``loss_cons`` and their weights.
+            value-oracle training, also ``loss_value`` plus per-stratum
+            diagnostics and the two task weights.
         """
-        has_labels = len(micro_batch) == 9
+        has_labels = len(micro_batch) == 6
         if has_labels:
             (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size,
-             micro_o, micro_i, micro_is_id, micro_c_triples) = micro_batch
+             micro_labels) = micro_batch
         else:
             (micro_X, micro_y, micro_d, micro_seq_len, micro_train_size) = micro_batch
-            micro_o = micro_i = None
-            micro_is_id = None
-            micro_c_triples = None
+            micro_labels = None
 
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
@@ -653,10 +727,6 @@ class Trainer:
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
-        if has_labels:
-            micro_o = micro_o.to(self.config.device)
-            micro_i = micro_i.to(self.config.device)
-            micro_is_id = micro_is_id.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -675,8 +745,7 @@ class Trainer:
                 total_loss, bd = self.loss_fn(
                     logits=logits, y_true=y_test,
                     col_emb=col_emb,
-                    o_star=micro_o, i_star=micro_i,
-                    is_id=micro_is_id, c_triples=micro_c_triples,
+                    labels=micro_labels,
                     d=micro_d,
                 )
                 pred = logits.flatten(end_dim=-2)
@@ -697,14 +766,14 @@ class Trainer:
             micro_results = {"ce": (bd.pred if bd else scaled_loss.item())}
             if bd is not None:
                 micro_results["loss_total"] = scaled_loss.item()
-                micro_results["loss_A"] = bd.A / num_micro_batches
-                micro_results["loss_I"] = bd.I / num_micro_batches
-                micro_results["loss_C"] = bd.C / num_micro_batches
-                micro_results["loss_cons"] = bd.cons / num_micro_batches
+                micro_results["loss_value"] = bd.value / num_micro_batches
+                micro_results["loss_value_empty"] = bd.value_empty
+                micro_results["loss_value_singleton"] = bd.value_singleton
+                micro_results["loss_value_small"] = bd.value_small
+                micro_results["loss_value_medium"] = bd.value_medium
+                micro_results["loss_value_near_full"] = bd.value_near_full
                 micro_results["w_pred"] = bd.w_pred
-                micro_results["w_A"] = bd.w_A
-                micro_results["w_I"] = bd.w_I
-                micro_results["w_C"] = bd.w_C
+                micro_results["w_value"] = bd.w_value
                 micro_results["ce"] = bd.pred / num_micro_batches
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
@@ -745,8 +814,8 @@ class Trainer:
         ]
 
         # Split the batch into micro-batches along the first dimension.
-        # Phase 4's 9-tuple carries a Python list for `c_triples`, which is
-        # not torch-splittable — slice it explicitly by row indices.
+        # The labels element (when present) is a Python list, not a tensor,
+        # so it needs row-index slicing instead of torch.split.
         num_micro_batches = math.ceil(self.config.batch_size / self.config.micro_batch_size)
         mbs = self.config.micro_batch_size
 
@@ -784,11 +853,18 @@ class Trainer:
             )
 
         # Clip the gradient
+        skip_step = False
         if self.config.gradient_clipping > 0:
             self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            total_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
             if getattr(self, "loss_fn", None) is not None:
-                nn.utils.clip_grad_norm_(self.loss_fn.parameters(), self.config.gradient_clipping)
+                loss_norm = nn.utils.clip_grad_norm_(self.loss_fn.parameters(), self.config.gradient_clipping)
+            else:
+                loss_norm = None
+            if getattr(self.config, "nan_guard", False):
+                if not torch.isfinite(total_norm) or (loss_norm is not None and not torch.isfinite(loss_norm)):
+                    print(f"[nan_guard] step {self.curr_step}: non-finite grad norm (trunk={total_norm}, loss={loss_norm}); skipping optimizer step", flush=True)
+                    skip_step = True
 
         # Phase 4: trunk-freeze warmup — zero gradients on the pretraining
         # trunk for the first N steps so the heads stabilise before the
@@ -804,7 +880,8 @@ class Trainer:
                     p.grad.zero_()
 
         # Update parameters
-        self.scaler.step(self.optimizer)
+        if not skip_step:
+            self.scaler.step(self.optimizer)
         self.scaler.update()
 
         # Update the learning rate

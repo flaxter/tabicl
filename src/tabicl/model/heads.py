@@ -1,24 +1,21 @@
-"""Phase 2 — attribution head modules.
+"""Conditional predictive value head.
 
-Three heads consume per-column embeddings ``e`` of shape ``(B, H, E)`` as
-returned by ``TabICL.forward(..., return_column_embeddings=True)``:
+The head consumes per-column embeddings ``e`` of shape ``(B, H, E)`` returned
+by ``TabICL.forward(..., return_column_embeddings=True)`` together with a
+boolean conditioning-set mask ``cond_mask`` of shape ``(B, H)``, and emits a
+score per feature estimating the RMS conditional predictive value
 
-- ``ObservationalHead``  (Head A): observational information score per feature,
-  parameter-shared MLP applied independently to each column so the mapping is
-  permutation-equivariant by construction.
-- ``InterventionalHead`` (Head I): interventional-effect magnitude per feature.
-  Architecturally identical to Head A with separate weights. The PLAN's
-  identifiability scoping (train only on identifiable priors) is enforced at
-  the loss via an ``is_identifiable`` sample mask, not inside this module.
-- ``ConditionalHead``    (Head C): conditional contribution c_{i|S}. Consumes
-  the per-column embeddings and a boolean conditioning-set mask, emits a
-  scalar per feature. Conditioning-set representation is a sum-pool over e_S
-  (PLAN §Phase 2); attention-pool is scheduled as an ablation in §Phase 6d.
+    r_{i|S} = sqrt(Delta_{i|S}),   Delta_{i|S} = V(S union {i}) - V(S),
 
-The trunk stays frozen for the first 1000 steps of training (PLAN §Phase 4)
-while these heads stabilise. To make that warmup useful, each head's final
-linear layer is initialised with small weights so untrained heads produce
-near-zero outputs rather than random offsets.
+where V(S) = Var(E[Y | X_S]). The head returns a length-H vector for every
+batch element in one forward pass per information state ``S``. Callers mask
+entries at positions ``i in S`` (the output there is architecturally defined
+but semantically undefined — see the predictive oracle public API).
+
+The trunk stays frozen for the first 1000 steps of training (PLAN Phase 4)
+while the head stabilises. The final linear layer is initialised with small
+weights so the untrained head produces near-zero outputs rather than random
+offsets.
 """
 from __future__ import annotations
 
@@ -37,118 +34,18 @@ def _build_activation(name: str) -> nn.Module:
 
 
 def _small_init_final_layer(linear: nn.Linear, std: float = 0.01) -> None:
-    """Small-weight init for the output projection of an attribution head."""
+    """Small-weight init for the output projection of the head."""
     nn.init.normal_(linear.weight, mean=0.0, std=std)
     if linear.bias is not None:
         nn.init.zeros_(linear.bias)
 
 
-class _PerColumnScalarMLP(nn.Module):
-    """MLP ``E -> hidden -> 1`` applied independently to every column.
-
-    Shared building block for Heads A and I. The same weights are applied to
-    every column embedding along the H axis, which makes the resulting score
-    tensor permutation-equivariant over columns.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        hidden_dim: Optional[int] = None,
-        activation: str = "gelu",
-    ) -> None:
-        super().__init__()
-        if embed_dim <= 0:
-            raise ValueError(f"embed_dim must be positive, got {embed_dim}")
-        hidden_dim = hidden_dim if hidden_dim is not None else max(1, embed_dim // 2)
-
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.act = _build_activation(activation)
-        self.fc2 = nn.Linear(hidden_dim, 1)
-
-        _small_init_final_layer(self.fc2)
-
-    def forward(self, column_embeddings: Tensor) -> Tensor:
-        if column_embeddings.dim() != 3:
-            raise ValueError(
-                f"Expected column_embeddings of shape (B, H, E), got {tuple(column_embeddings.shape)}"
-            )
-        x = self.fc1(column_embeddings)       # (B, H, hidden)
-        x = self.act(x)
-        x = self.fc2(x)                       # (B, H, 1)
-        return x.squeeze(-1)                  # (B, H)
-
-
-class ObservationalHead(nn.Module):
-    """Head A — observational information score per feature.
-
-    Parameters
-    ----------
-    embed_dim : int
-        Dimensionality ``E`` of the per-column embeddings emitted by the
-        trunk. Must match ``TabICL.embed_dim``.
-    hidden_dim : Optional[int], default=None
-        Hidden-layer dimension. Defaults to ``embed_dim // 2``.
-    activation : str, default="gelu"
-        Activation between the two linear layers. ``"gelu"`` or ``"relu"``.
-
-    Notes
-    -----
-    The PLAN target o*_i is on the scale of ``Var(y)``. Do not apply a
-    squashing nonlinearity to the output — the loss (Huber, delta=1.0) is
-    expected to operate on the natural-scale score.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        hidden_dim: Optional[int] = None,
-        activation: str = "gelu",
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.mlp = _PerColumnScalarMLP(embed_dim, hidden_dim=hidden_dim, activation=activation)
-
-    def forward(self, column_embeddings: Tensor) -> Tensor:
-        """Compute ``(B, H)`` scores from per-column embeddings ``(B, H, E)``."""
-        return self.mlp(column_embeddings)
-
-
-class InterventionalHead(nn.Module):
-    """Head I — interventional effect magnitude per feature.
-
-    Same architecture as ``ObservationalHead`` with independent weights. The
-    identifiability restriction (train only on identifiable prior families) is
-    applied at the training objective via a per-sample ``is_identifiable``
-    mask; this module is architecturally unconstrained.
-    """
-
-    def __init__(
-        self,
-        embed_dim: int,
-        hidden_dim: Optional[int] = None,
-        activation: str = "gelu",
-    ) -> None:
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.mlp = _PerColumnScalarMLP(embed_dim, hidden_dim=hidden_dim, activation=activation)
-
-    def forward(self, column_embeddings: Tensor) -> Tensor:
-        """Compute ``(B, H)`` scores from per-column embeddings ``(B, H, E)``."""
-        return self.mlp(column_embeddings)
-
-
-class ConditionalHead(nn.Module):
-    """Head C — conditional contribution c_{i|S} per feature.
-
-    Consumes the per-column embeddings together with a boolean mask marking
-    which features belong to the conditioning set ``S``, and emits a scalar
-    per feature: the conditional contribution of revealing ``X_i`` given
-    ``X_S``.
+class ConditionalPredictiveValueHead(nn.Module):
+    """Estimate RMS conditional predictive value r_{i|S} = sqrt(Delta_{i|S}).
 
     The conditioning-set representation ``e_S`` is a sum-pool over the columns
-    selected by the mask, as committed in PLAN §Phase 2. An attention-pool
-    alternative is scheduled as an ablation in §Phase 6d.
+    selected by the mask. Fusion MLP consumes ``concat(e_i, e_S)`` and emits a
+    scalar per feature.
 
     Parameters
     ----------
@@ -157,20 +54,19 @@ class ConditionalHead(nn.Module):
     hidden_dim : Optional[int], default=None
         Hidden-layer dimension for the fusion MLP. Defaults to ``embed_dim // 2``.
     activation : str, default="gelu"
-        Activation between the two linear layers.
+        Activation between the two linear layers. ``"gelu"`` or ``"relu"``.
 
     Notes
     -----
-    The head computes a score for *every* feature in one forward pass — the
-    natural substrate for the Phase 5 sklearn API call
-    ``marginal_conditional_contributions(S=[...])``. Callers typically use
-    only the scores at positions outside ``S``; positions inside ``S`` are
-    still computed (the architecture is position-symmetric) and should be
-    masked out downstream.
+    The head computes a score for every feature in one forward pass — the
+    substrate for the sklearn API call ``conditional_predictive_values(S)``.
+    Positions inside ``S`` are still computed (the architecture is
+    position-symmetric) and should be masked to ``NaN`` by the caller.
 
-    Training schedule (PLAN §Phase 3): ``k = min(H, 16)`` random ``(i, S)``
-    triples per dataset per step. Sampling is the training loop's job, not
-    this module's.
+    Empty ``S`` is valid: ``e_S = 0`` and the head reduces to a function of
+    ``e_i`` alone. Near-full ``S`` (size ``p - 1`` or ``p - 2``) is also
+    valid and is sampled explicitly during training to cover the
+    leave-one-out endpoint.
     """
 
     def __init__(
@@ -185,7 +81,6 @@ class ConditionalHead(nn.Module):
         self.embed_dim = embed_dim
         hidden_dim = hidden_dim if hidden_dim is not None else max(1, embed_dim // 2)
 
-        # Fusion MLP consumes concat(e_i, e_S) of dimension 2 * embed_dim.
         self.fc1 = nn.Linear(2 * embed_dim, hidden_dim)
         self.act = _build_activation(activation)
         self.fc2 = nn.Linear(hidden_dim, 1)
@@ -193,7 +88,7 @@ class ConditionalHead(nn.Module):
         _small_init_final_layer(self.fc2)
 
     def forward(self, column_embeddings: Tensor, cond_mask: Tensor) -> Tensor:
-        """Compute a conditional-contribution score for every feature.
+        """Compute a conditional predictive value score for every feature.
 
         Parameters
         ----------
@@ -202,14 +97,13 @@ class ConditionalHead(nn.Module):
         cond_mask : Tensor
             Boolean mask of shape ``(B, H)``. ``True`` marks features in the
             conditioning set ``S``; ``False`` marks features not in ``S``.
-            An all-``False`` row corresponds to ``S = ∅`` — ``e_S`` is then
-            the zero vector and the head reduces to a function of ``e_i``
-            alone.
+            An all-``False`` row corresponds to ``S = empty`` — ``e_S`` is
+            then the zero vector.
 
         Returns
         -------
         Tensor
-            Per-feature scores of shape ``(B, H)``.
+            Per-feature RMS scores of shape ``(B, H)``.
         """
         if column_embeddings.dim() != 3:
             raise ValueError(

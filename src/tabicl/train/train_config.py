@@ -159,6 +159,40 @@ def build_parser():
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
 
+    # Label path (REMEDY.md): overrides for scm_fixed_hp at genload time.
+    parser.add_argument(
+        "--label_estimator",
+        default=None,
+        type=str,
+        choices=["histogram", "direct_knn", "direct_ridge", "direct_kernel"],
+        help="Override scm_fixed_hp['label_estimator']. None leaves the default (histogram).",
+    )
+    parser.add_argument(
+        "--label_mixture",
+        default=None,
+        type=str,
+        choices=["default", "backup", "easy"],
+        help="Override scm_fixed_hp['label_mixture']. None leaves the config default (backup).",
+    )
+    parser.add_argument(
+        "--label_n_oracle",
+        default=None,
+        type=int,
+        help="Override scm_fixed_hp['label_n_oracle']. Default 512.",
+    )
+    parser.add_argument(
+        "--label_knn_folds",
+        default=None,
+        type=int,
+        help="Override scm_fixed_hp['label_knn_folds'] for direct-Delta estimators. Default 5.",
+    )
+    parser.add_argument(
+        "--label_knn_k",
+        default=None,
+        type=int,
+        help="Override scm_fixed_hp['label_knn_k']. Default ceil(sqrt(n_train)).",
+    )
+
     ###########################################################################
     ##### Model Architecture Config ###########################################
     ###########################################################################
@@ -180,6 +214,13 @@ def build_parser():
     parser.add_argument("--col_num_blocks", type=int, default=3, help="Number of blocks in column embedder")
     parser.add_argument("--col_nhead", type=int, default=4, help="Number of attention heads in column embedder")
     parser.add_argument("--col_num_inds", type=int, default=128, help="Number of inducing points in column embedder")
+    parser.add_argument(
+        "--col_target_aware", default=True, type=str2bool,
+        help="If True, the column embedder builds a y_encoder and attends over (x, y). "
+        "Upstream v1.1 was trained with target_aware=False, so heads-only fine-tunes of "
+        "v1.1 must set this to False or the y_encoder is random-init under freeze_col and "
+        "corrupts every column embedding.",
+    )
     parser.add_argument("--freeze_col", default=False, type=str2bool, help="Whether to freeze the column embedder")
     parser.add_argument(
         "--col_feature_group",
@@ -202,6 +243,31 @@ def build_parser():
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
 
+    # SSMax scaling — upstream v1/v1.1 checkpoints predate ssmax layers and
+    # need both flags set to False; v2 keeps the default 'qassmax-mlp-elementwise'.
+    parser.add_argument(
+        "--col_ssmax",
+        default="qassmax-mlp-elementwise",
+        type=str,
+        help="Column-attention SSMax scaling mode: False/'false'/'qassmax-mlp-elementwise'/'ssmax'/etc.",
+    )
+    parser.add_argument(
+        "--icl_ssmax",
+        default="qassmax-mlp-elementwise",
+        type=str,
+        help="ICL-attention SSMax scaling mode: same values as --col_ssmax.",
+    )
+    parser.add_argument(
+        "--bias_free_ln",
+        default=False,
+        type=str2bool,
+        help="If True, all LayerNorm layers in the trunk are constructed "
+        "without bias parameters. Upstream v2 regressor was trained with "
+        "bias_free_ln=True and has no norm.bias tensors in its state_dict; "
+        "loading it into a model built with default False produces 48 random "
+        "norm.bias params that contaminate the frozen trunk.",
+    )
+
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability")
@@ -217,7 +283,7 @@ def build_parser():
         "--multi_task_enabled",
         default=True,
         type=str2bool,
-        help="Phase 4: train attribution heads (A/I/C) alongside the classification head.",
+        help="Train the conditional predictive value head alongside the classification head.",
     )
     parser.add_argument(
         "--multi_task_weighting",
@@ -227,27 +293,34 @@ def build_parser():
         help="Loss combination scheme: 'uncertainty' (Kendall et al. 2018, learned log-sigma) or 'manual' lambdas.",
     )
     parser.add_argument("--lambda_pred", type=float, default=1.0, help="Manual lambda on classification loss.")
-    parser.add_argument("--lambda_obs", type=float, default=1.0, help="Manual lambda on Head A (observational).")
-    parser.add_argument("--lambda_int", type=float, default=1.0, help="Manual lambda on Head I (interventional).")
-    parser.add_argument("--lambda_cond", type=float, default=1.0, help="Manual lambda on Head C (conditional).")
-    parser.add_argument("--huber_delta", type=float, default=1.0, help="Huber loss delta for attribution heads.")
+    parser.add_argument("--lambda_value", type=float, default=1.0, help="Manual lambda on value-oracle loss.")
+    parser.add_argument("--huber_delta", type=float, default=1.0, help="Huber loss delta for the value head.")
     parser.add_argument(
-        "--head_c_consistency_weight",
-        type=float,
-        default=0.0,
-        help="Weight on |head_a_i - head_c_{i|-i}| consistency penalty. 0 disables.",
+        "--nan_guard",
+        action="store_true",
+        help="Skip optimizer.step() when the clipped gradient norm is non-finite. "
+        "Belt-and-braces guard against rare gradient spikes; default off preserves existing behaviour.",
+    )
+    parser.add_argument(
+        "--load_model_strict",
+        type=str2bool,
+        default=True,
+        help="Pass strict= to raw_model.load_state_dict(). Default True preserves "
+        "existing behaviour. Set False when loading an upstream v1/v2 checkpoint "
+        "whose output head has a different shape than the Phase-4 multi-task heads "
+        "(e.g. loading v2 regressor weights onto a classifier training config).",
     )
     parser.add_argument(
         "--trunk_freeze_steps",
         type=int,
         default=1000,
-        help="Number of initial steps where trunk gradients are zeroed (heads train alone).",
+        help="Number of initial steps where trunk gradients are zeroed (value head trains alone).",
     )
     parser.add_argument(
         "--head_embed_dim",
         type=int,
         default=None,
-        help="Hidden dim inside each attribution head's MLP. Defaults to model embed_dim.",
+        help="Hidden dim inside the value head's MLP. Defaults to model embed_dim.",
     )
 
     ###########################################################################

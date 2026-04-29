@@ -1,279 +1,176 @@
-"""Phase 5 — scikit-learn attribution API tests.
+"""Tests for the predictive-oracle TabICLExplainer API.
 
-Verify interface correctness of :class:`TabICLExplainer`:
-
-- ``fit`` populates the static attribution attributes
-  (``observational_relevance_``, ``interventional_effects_``,
-  ``identifiability_scope_``) with the right shapes and types.
-- ``predict`` / ``predict_proba`` delegate unchanged to the base
-  estimator.
-- Conditioning-set semantics for Head C: entries inside ``S`` are NaN,
-  entries for constant-dropped features are NaN, threshold extremes of
-  ``conditional_relevance_graph`` produce all-False / all-True matrices.
-- Head-checkpoint round-trip: save + load via
-  ``heads_checkpoint_path`` gives bit-identical Head A scores.
-- Same flow works end-to-end for ``TabICLRegressor``.
-
-These tests do **not** verify attribution accuracy — the heads here are
-freshly-initialised and untrained. Attribution quality is Phase 6.
-
-To avoid depending on the HF Hub pretrained-checkpoint download, each
-test builds a tiny in-memory ``TabICL`` model and monkey-patches the
-base estimator's ``_load_model`` to install it.
+These use a monkey-patched tiny TabICL (no HF-Hub download) to keep the
+tests fast; we only care about the wrapper semantics, not trunk quality.
 """
 from __future__ import annotations
 
-import copy
-from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from sklearn.datasets import make_classification, make_regression
+from torch import nn
 
-from tabicl import TabICLClassifier, TabICLRegressor, TabICLExplainer
-from tabicl.model.heads import (
-    ObservationalHead,
-    InterventionalHead,
-    ConditionalHead,
-)
-from tabicl.model.tabicl import TabICL
+from tabicl.model.heads import ConditionalPredictiveValueHead
+from tabicl.sklearn.explainer import TabICLExplainer
 
 
 # ---------------------------------------------------------------------------
-# Test fixtures
+# Tiny in-memory base estimator stub
 # ---------------------------------------------------------------------------
 
 
-EMBED_DIM = 32
+class _DummyUniqueFilter:
+    def __init__(self, keep: np.ndarray):
+        self.features_to_keep_ = keep
 
 
-def _build_tiny_tabicl(max_classes: int, seed: int = 0) -> TabICL:
-    torch.manual_seed(seed)
-    return TabICL(
-        max_classes=max_classes,
-        embed_dim=EMBED_DIM,
-        col_num_blocks=2,
-        col_nhead=4,
-        col_num_inds=8,
-        icl_num_blocks=2,
-        icl_nhead=4,
-        row_num_blocks=2,
-        row_nhead=4,
-        row_num_cls=2,
-        ff_factor=2,
-    )
+class _DummyPreprocessor:
+    def __init__(self, X_transformed: np.ndarray):
+        self.X_transformed_ = X_transformed
 
 
-def _install_tiny_model(estimator, max_classes: int) -> None:
-    """Replace the estimator's ``_load_model`` to use an in-memory tiny TabICL.
-
-    Avoids downloading a pretrained checkpoint from HF Hub; Phase 5
-    tests care about the attribution interface, not trunk weights.
-    """
-    tiny = _build_tiny_tabicl(max_classes=max_classes)
-
-    def _fake_load_model(self=estimator):
-        self.model_path_ = None
-        self.model_ = tiny
-        self.model_config_ = {
-            "max_classes": max_classes,
-            "embed_dim": EMBED_DIM,
-        }
-        self.model_.eval()
-
-    estimator._load_model = _fake_load_model
+class _DummyEnsembleGenerator:
+    def __init__(self, X_filtered: np.ndarray, y: np.ndarray, keep: np.ndarray):
+        self.preprocessors_ = {"quantile_normal": _DummyPreprocessor(X_filtered)}
+        self.y_ = y
+        self.unique_filter_ = _DummyUniqueFilter(keep)
 
 
-def _fresh_heads(embed_dim: int = EMBED_DIM) -> dict:
+class _DummyTabICL(nn.Module):
+    """Trunk stub that emits deterministic per-column embeddings."""
+
+    def __init__(self, embed_dim: int = 8):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self._proj = nn.Linear(1, embed_dim, bias=False)
+        nn.init.eye_(self._proj.weight.view(embed_dim, 1)[:1, :])  # identity-ish
+
+    def forward(self, X, y_train=None, return_column_embeddings=False, inference_config=None):
+        # X: (1, T, H). Take per-column mean over T, project to (1, H, E).
+        col_mean = X.mean(dim=1, keepdim=True).transpose(1, 2)  # (1, H, 1)
+        col_emb = torch.tanh(self._proj(col_mean))  # (1, H, E)
+        logits = torch.zeros(1, 1, 2)  # dummy
+        if return_column_embeddings:
+            return logits, col_emb
+        return logits
+
+
+class _DummyBaseEstimator:
+    def __init__(self, n_features: int = 5, n_kept: int = 5):
+        self.n_features = n_features
+        self.n_kept = n_kept
+
+    def fit(self, X, y):
+        self.n_features_in_ = self.n_features
+        keep = np.zeros(self.n_features, dtype=bool)
+        keep[: self.n_kept] = True
+        X_filtered = np.asarray(X, dtype=np.float32)[:, :self.n_kept]
+        y_arr = np.asarray(y, dtype=np.float32)
+        self.ensemble_generator_ = _DummyEnsembleGenerator(X_filtered, y_arr, keep)
+        self.model_ = _DummyTabICL(embed_dim=8)
+        self.device_ = torch.device("cpu")
+        self.inference_config_ = None
+        return self
+
+    def predict(self, X):
+        return np.zeros(len(X), dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _fit_explainer(n_features: int = 5, n_kept: int = 5) -> TabICLExplainer:
     torch.manual_seed(0)
-    return {
-        "observational": ObservationalHead(embed_dim=embed_dim),
-        "interventional": InterventionalHead(embed_dim=embed_dim),
-        "conditional": ConditionalHead(embed_dim=embed_dim),
-    }
-
-
-def _small_classification_dataset(n=40, p=5, seed=0):
-    X, y = make_classification(
-        n_samples=n, n_features=p, n_informative=p, n_redundant=0,
-        n_classes=2, random_state=seed,
-    )
-    X = X.astype(np.float32)
-    return X[:30], y[:30], X[30:]
-
-
-def _small_regression_dataset(n=40, p=5, seed=0):
-    X, y = make_regression(n_samples=n, n_features=p, random_state=seed)
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
-    return X[:30], y[:30], X[30:]
-
-
-def _build_fitted_classifier_explainer(X_train, y_train, heads=None, **kwargs):
-    clf = TabICLClassifier(n_estimators=2, random_state=0, verbose=False)
-    _install_tiny_model(clf, max_classes=10)  # generous upper bound
-    expl = TabICLExplainer(
-        base_estimator=clf,
-        heads=heads if heads is not None else _fresh_heads(),
-        **kwargs,
-    )
-    expl.fit(X_train, y_train)
+    base = _DummyBaseEstimator(n_features=n_features, n_kept=n_kept)
+    head = ConditionalPredictiveValueHead(embed_dim=8)
+    expl = TabICLExplainer(base_estimator=base, value_head=head)
+    X = np.random.default_rng(0).standard_normal((30, n_features)).astype(np.float32)
+    y = np.random.default_rng(1).integers(0, 2, size=30)
+    expl.fit(X, y)
     return expl
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# API semantics
 # ---------------------------------------------------------------------------
 
 
-def test_explainer_fit_populates_attribution_attributes():
-    X_train, y_train, _ = _small_classification_dataset()
-    expl = _build_fitted_classifier_explainer(X_train, y_train)
-
-    assert expl.observational_relevance_.shape == (X_train.shape[1],)
-    assert expl.interventional_effects_.shape == (X_train.shape[1],)
-    assert expl.observational_relevance_.dtype == np.float64
-    assert expl.interventional_effects_.dtype == np.float64
-    assert isinstance(expl.identifiability_scope_, str)
-    assert len(expl.identifiability_scope_) > 0
+def test_conditional_predictive_values_shape_is_n_features_in():
+    expl = _fit_explainer(n_features=5)
+    out = expl.conditional_predictive_values([])
+    assert out.shape == (5,)
 
 
-def test_explainer_predict_delegates_to_base():
-    X_train, y_train, X_test = _small_classification_dataset()
-    expl = _build_fitted_classifier_explainer(X_train, y_train)
-
-    pred_base = expl.base_estimator_.predict(X_test)
-    pred_expl = expl.predict(X_test)
-    np.testing.assert_array_equal(pred_base, pred_expl)
-
-    proba_base = expl.base_estimator_.predict_proba(X_test)
-    proba_expl = expl.predict_proba(X_test)
-    np.testing.assert_allclose(proba_base, proba_expl)
+def test_conditional_predictive_values_NaN_inside_S():
+    expl = _fit_explainer(n_features=5)
+    out = expl.conditional_predictive_values([1, 3])
+    assert np.isnan(out[1])
+    assert np.isnan(out[3])
+    # Positions outside S should be finite (dummy-head outputs are finite).
+    assert np.isfinite(out[[0, 2, 4]]).all()
 
 
-def test_unique_filter_gives_nan_on_constant_features():
-    X_train, y_train, _ = _small_classification_dataset(p=5)
-    # Make column 2 constant — UniqueFeatureFilter will drop it.
-    X_train = X_train.copy()
-    X_train[:, 2] = 3.14
-
-    expl = _build_fitted_classifier_explainer(X_train, y_train)
-
-    assert np.isnan(expl.observational_relevance_[2])
-    assert np.isnan(expl.interventional_effects_[2])
-    # Surviving features must be finite.
-    kept = [i for i in range(5) if i != 2]
-    assert np.isfinite(expl.observational_relevance_[kept]).all()
-    assert np.isfinite(expl.interventional_effects_[kept]).all()
+def test_conditional_predictive_values_NaN_for_dropped_features():
+    """Constant-filtered features are not in the trunk's feature set and
+    should come back as NaN regardless of S."""
+    expl = _fit_explainer(n_features=5, n_kept=3)
+    out = expl.conditional_predictive_values([])
+    # Features 3 and 4 were filtered out — must be NaN.
+    assert np.isnan(out[3])
+    assert np.isnan(out[4])
+    assert np.isfinite(out[[0, 1, 2]]).all()
 
 
-def test_marginal_conditional_contributions_masks_S():
-    X_train, y_train, _ = _small_classification_dataset(p=5)
-    expl = _build_fitted_classifier_explainer(X_train, y_train)
-
-    scores = expl.marginal_conditional_contributions(S=[1])
-    assert scores.shape == (5,)
-    assert np.isnan(scores[1])
-    # Everyone else finite.
-    for j in (0, 2, 3, 4):
-        assert np.isfinite(scores[j]), f"Expected finite score at position {j}, got {scores[j]}"
-
-    # Empty S — all features finite.
-    scores_empty = expl.marginal_conditional_contributions(S=[])
-    assert np.isfinite(scores_empty).all()
+def test_predictive_sufficiency_equals_empty_query():
+    expl = _fit_explainer(n_features=5)
+    empty_query = expl.conditional_predictive_values([])
+    suff = expl.predictive_sufficiency_
+    finite = np.isfinite(suff)
+    assert np.allclose(suff[finite], empty_query[finite], atol=1e-6)
 
 
-def test_conditional_relevance_graph_threshold_extremes():
-    X_train, y_train, _ = _small_classification_dataset(p=4)
-    expl = _build_fitted_classifier_explainer(X_train, y_train)
-
-    # Very high threshold → no edges pass.
-    empty_graph = expl.conditional_relevance_graph(threshold=1e9)
-    assert empty_graph.shape == (4, 4)
-    assert empty_graph.dtype == bool
-    assert not empty_graph.any()
-
-    # Very low threshold → every off-diagonal entry is True.
-    full_graph = expl.conditional_relevance_graph(threshold=-1e9)
-    assert full_graph.dtype == bool
-    off_diag = ~np.eye(4, dtype=bool)
-    assert full_graph[off_diag].all()
-    # Diagonal is always False by convention.
-    assert not np.diag(full_graph).any()
+def test_predictive_necessity_shape_and_diagonal_logic():
+    """predictive_necessity_[i] should equal conditional_predictive_values(
+    [j for j != i])[i] for every valid (not filtered) feature."""
+    expl = _fit_explainer(n_features=4, n_kept=4)
+    nec = expl.predictive_necessity_
+    assert nec.shape == (4,)
+    for i in range(4):
+        S = [j for j in range(4) if j != i]
+        out = expl.conditional_predictive_values(S)
+        assert np.isclose(nec[i], out[i], atol=1e-6), (
+            f"necessity[{i}]={nec[i]:.4f} vs conditional[{i}|S]={out[i]:.4f}"
+        )
 
 
-def test_regressor_explainer_works_end_to_end():
-    X_train, y_train, X_test = _small_regression_dataset(p=4)
-
-    reg = TabICLRegressor(n_estimators=2, random_state=0, verbose=False)
-    _install_tiny_model(reg, max_classes=0)
-    expl = TabICLExplainer(base_estimator=reg, heads=_fresh_heads())
-    expl.fit(X_train, y_train)
-
-    assert expl.observational_relevance_.shape == (4,)
-    assert expl.interventional_effects_.shape == (4,)
-
-    # Regressor has predict() but not predict_proba.
-    pred = expl.predict(X_test)
-    assert pred.shape == (X_test.shape[0],)
-    with pytest.raises(AttributeError):
-        expl.predict_proba(X_test)
+def test_greedy_predictive_path_returns_valid_permutation_of_kept():
+    expl = _fit_explainer(n_features=4, n_kept=4)
+    path, gains = expl.greedy_predictive_path(k=4)
+    assert sorted(path) == list(range(4)), f"path not a permutation: {path}"
+    assert len(gains) == 4
 
 
-def test_heads_checkpoint_roundtrip(tmp_path: Path):
-    X_train, y_train, _ = _small_classification_dataset(p=5)
-
-    heads = _fresh_heads()
-    expl_direct = _build_fitted_classifier_explainer(
-        X_train, y_train, heads=copy.deepcopy(heads),
-    )
-    direct_scores = expl_direct.observational_relevance_.copy()
-
-    ckpt_path = tmp_path / "phase5_heads.pt"
-    torch.save(
-        {
-            "heads": {
-                "observational": heads["observational"].state_dict(),
-                "interventional": heads["interventional"].state_dict(),
-                "conditional": heads["conditional"].state_dict(),
-                "config": {"embed_dim": EMBED_DIM, "hidden_dim": None},
-            },
-        },
-        ckpt_path,
-    )
-
-    clf = TabICLClassifier(n_estimators=2, random_state=0, verbose=False)
-    _install_tiny_model(clf, max_classes=10)
-    expl_loaded = TabICLExplainer(
-        base_estimator=clf,
-        heads_checkpoint_path=ckpt_path,
-    )
-    expl_loaded.fit(X_train, y_train)
-
-    np.testing.assert_allclose(
-        direct_scores, expl_loaded.observational_relevance_,
-        rtol=0, atol=0,
-    )
+def test_greedy_path_skips_dropped_features():
+    expl = _fit_explainer(n_features=5, n_kept=3)
+    path, _ = expl.greedy_predictive_path()
+    # Must never pick a filtered-out feature.
+    assert all(i < 3 for i in path), f"greedy path included dropped features: {path}"
+    # Budget exhausts the kept features.
+    assert len(path) == 3
 
 
-def test_rejects_ambiguous_head_sources(tmp_path: Path):
-    """Can't pass both heads and heads_checkpoint_path; can't pass neither."""
-    X_train, y_train, _ = _small_classification_dataset(p=4)
+def test_conditional_value_graph_shape_and_diag_false():
+    expl = _fit_explainer(n_features=4, n_kept=4)
+    g = expl.conditional_value_graph(threshold=-1e9)  # permissive, fill with True
+    assert g.shape == (4, 4)
+    assert not g.diagonal().any()
 
-    clf = TabICLClassifier(n_estimators=2, random_state=0, verbose=False)
-    _install_tiny_model(clf, max_classes=10)
 
-    expl_none = TabICLExplainer(base_estimator=clf)
-    with pytest.raises(ValueError, match="No attribution heads"):
-        expl_none.fit(X_train, y_train)
-
-    dummy_ckpt = tmp_path / "x.pt"
-    torch.save({"heads": {}}, dummy_ckpt)
-    expl_both = TabICLExplainer(
-        base_estimator=clf,
-        heads=_fresh_heads(),
-        heads_checkpoint_path=dummy_ckpt,
-    )
-    with pytest.raises(ValueError, match="at most one"):
-        expl_both.fit(X_train, y_train)
+def test_invalid_S_index_raises():
+    expl = _fit_explainer(n_features=3)
+    with pytest.raises(ValueError):
+        expl.conditional_predictive_values([5])  # out of range
